@@ -140,28 +140,17 @@ jobs:
           echo "注入完成"
           ls "$ROOT/usr/lib/lua/luci/controller/store.lua" 2>/dev/null || echo "⚠️store.lua 未找到"
 
-      - name: 修正 iStore 菜单层级（挂到系统下）
+      - name: 首次启动清理 LuCI 缓存（让预装菜单生效）
         run: |
           set -e
           ROOT=$(ls -d rw/*/ 2>/dev/null | head -1); [ -d "$ROOT" ] || ROOT="rw/"
-          F="$ROOT/usr/lib/lua/luci/controller/store.lua"
-          if [ -f "$F" ]; then
-            echo "修正前 admin/store 出现次数: $(grep -c '"admin", "store"' "$F")"
-            sed -i 's|{"admin", "store"|{"admin", "system", "store"|g' "$F"
-            echo "修正后新路径次数: $(grep -c '"admin", "system", "store"' "$F")"
-            # 保留原文件备份，便于回溯
-            cp "$F" "$F.orig"
-          else
-            echo "::warning::未找到 store.lua，跳过"
-          fi
-          # 预置首次启动脚本（清 LuCI 缓存让新菜单生效）
           mkdir -p "$ROOT/etc/uci-defaults"
-          cat > "$ROOT/etc/uci-defaults/99-istore-menu" <<'EOF'
+          cat > "$ROOT/etc/uci-defaults/99-luci-refresh" <<'EOF'
 #!/bin/sh
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null
 exit 0
 EOF
-          chmod +x "$ROOT/etc/uci-defaults/99-istore-menu"
+          chmod +x "$ROOT/etc/uci-defaults/99-luci-refresh"
 
       - name: 重新打包 rootfs
         run: |
@@ -208,7 +197,7 @@ EOF
         uses: ncipollo/release-action@v1
         with:
           tag: N1-X96MaxPlus-iStore
-          name: "OpenWrt for N1 & X96Max+（含 iStore 商店，菜单已统一）"
+          name: "OpenWrt for N1 & X96Max+（含 iStore 应用商店）"
           allowUpdates: true
           removeArtifacts: true
           artifacts: firmware/*
@@ -220,11 +209,8 @@ EOF
             - 内核：`${{ inputs.kernel_version }}`（ophub/kernel）
             - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
 
-            ### 注意
-            iStore 商店**自更新 luci-app-store 后会还原菜单层级**（回到顶层），
-            如需再次统一，重跑本 workflow 或手动执行：
-            ```
-            sed -i 's|{"admin", "store"|{"admin", "system", "store"|g' \
-              /usr/lib/lua/luci/controller/store.lua
-            rm -rf /tmp/luci-*cache && /etc/init.d/uhttpd restart
-            ```
+            ### 关于菜单位置
+            iStore 官方注册路径为 `admin/store`，会显示在侧边栏**顶层**（与"状态/系统"平级）。
+            这是上游插件自身的设计，**改它会导致页面路由失效**（实测报
+            `No page is registered at '/admin/store/pages/store'`），故**保持原样不做修改**。
+            如需访问请直接开：`http://<你的IP>/cgi-bin/luci/admin/store/main`
