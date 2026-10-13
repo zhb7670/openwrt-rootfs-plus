@@ -133,26 +133,31 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p /builder/opt/download
+          # ★ 用工作目录下的相对路径，不要用 /builder：
+          #   /builder 位于文件系统根，普通 runner 用户无权限创建（实测 Permission denied）。
+          #   flippy 脚本本身就用相对路径 opt/download，跟着它走即可。
+          mkdir -p opt/download
           echo "下载 $ROOTFS_NAME …"
           curl -fSL --retry 3 --retry-delay 5 \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/octet-stream" \
             "$ROOTFS_URL" \
-            -o "/builder/opt/download/$ROOTFS_NAME"
-          ls -lh "/builder/opt/download/"
+            -o "opt/download/$ROOTFS_NAME"
+          ls -lh opt/download/
           # 校验：必须是有效 gzip 且 > 10MB
-          sz=$(stat -c%s "/builder/opt/download/$ROOTFS_NAME")
-          [ "$sz" -gt 10485760 ] || { echo "::error::文件过小，可能下载失败"; exit 1; }
-          gzip -t "/builder/opt/download/$ROOTFS_NAME" || { echo "::warning::gzip 校验未通过（可能仍可用）"; }
+          sz=$(stat -c%s "opt/download/$ROOTFS_NAME")
+          [ "$sz" -gt 10485760 ] || { echo "::error::文件过小（$sz），可能下载失败"; exit 1; }
+          gzip -t "opt/download/$ROOTFS_NAME" || echo "::warning::gzip 校验未通过（可能仍可用）"
+          echo "OKrootfs 就位: $ROOTFS_NAME ($((sz/1024/1024)) MB)"
 
       - name: 调用 F大打包脚本
         id: package
         uses: ophub/flippy-openwrt-actions@main
         env:
-          # ★ flippy 只cp 不生成：OPENWRT_ARMSR 指向的文件会被原样复制成
+          # ★ flippy 只 cp 不生成：OPENWRT_ARMSR 指向的文件会被原样复制成
           #   PACKAGE_FILE=openwrt-armsr-armv8-generic-rootfs.tar.gz
-          OPENWRT_ARMSR: /builder/opt/download/${{ env.ROOTFS_NAME }}
+          #   必须用相对路径（flippy 内部按相对路径 cp）
+          OPENWRT_ARMSR: opt/download/${{ env.ROOTFS_NAME }}
           # s905x3 -> X96Max+/HK1/H96 Max X3/TX3；s905d -> 斐讯 N1
           PACKAGE_SOC: s905x3_s905d
           KERNEL_REPO_URL: ophub/kernel
