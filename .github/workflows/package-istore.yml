@@ -115,8 +115,11 @@ jobs:
       - name: 注入 iStore 软件源与预装包
         run: |
           set -e
-          ROOT=$(ls -d rw/*/ 2>/dev/null | head -1)
-          [ -d "$ROOT" ] || ROOT="rw/"
+          ROOT=""
+          for d in rw rw/*/; do
+            if [ -f "$d/etc/opkg/distfeeds.conf" ]; then ROOT="$d"; break; fi
+          done
+          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录（找 etc/opkg/distfeeds.conf）"; exit 1; }
           echo "rootfs 根目录: $ROOT"
 
           # 1) 追加 iStore 源
@@ -143,7 +146,12 @@ jobs:
       - name: 首次启动清理 LuCI 缓存（让预装菜单生效）
         run: |
           set -e
-          ROOT=$(ls -d rw/*/ 2>/dev/null | head -1); [ -d "$ROOT" ] || ROOT="rw/"
+          ROOT=""
+          for d in rw rw/*/; do
+            if [ -f "$d/etc/opkg/distfeeds.conf" ]; then ROOT="$d"; break; fi
+          done
+          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录（找 etc/opkg/distfeeds.conf）"; exit 1; }
+          echo "rootfs 根目录: $ROOT"
           mkdir -p "$ROOT/etc/uci-defaults"
           # 用 printf 而非 heredoc：heredoc 内容若不缩进会破坏 YAML 块结构
           printf '#!/bin/sh\nrm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null\nexit 0\n' \
@@ -154,7 +162,12 @@ jobs:
       - name: 重新打包 rootfs
         run: |
           set -e
-          ROOT=$(ls -d rw/*/ 2>/dev/null | head -1); [ -d "$ROOT" ] || ROOT="rw/"
+          ROOT=""
+          for d in rw rw/*/; do
+            if [ -f "$d/etc/opkg/distfeeds.conf" ]; then ROOT="$d"; break; fi
+          done
+          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录（找 etc/opkg/distfeeds.conf）"; exit 1; }
+          echo "rootfs 根目录: $ROOT"
           OUT="opt/download/$ROOTFS"
           rm -f "$OUT"
           tar czf "$OUT" -C "$ROOT" .
