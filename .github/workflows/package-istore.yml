@@ -1,0 +1,230 @@
+# =============================================================================
+#  在 rootfs 里预装 iStore 应用商店 + 修正菜单层级
+#
+#  做法（不改F大/海碧的 rootfs，本地解包后注入，重打包）：
+#    1. 下载 ophub 的 rootfs
+#    2. 解到临时目录
+#    3. 加入 iStore 软件源 + 预装 luci-app-store 及其依赖包
+#    4. 修正 store.lua 菜单层级：admin/store → admin/system/store
+#       （与 autoreboot/diskman 等插件一致，让它挂在"系统"下面）
+#    5. 重新打包成rootfs.tar.gz 交回 flippy 出固件
+#
+#  为什么预装而不是让用户自己装：
+#    - 用户反馈"界面不统一"——iStore 默认注册成 admin/store 会顶到侧边栏最顶层
+#    - 预装时直接改好层级，刷机即统一
+#    - 用户仍可在商店里更新 luci-app-store（更新会还原菜单路径，属可接受代价）
+#
+#  依赖包（Architecture: all，跨架构通用）：
+#    luci-app-store0.2.1-r1  taskd 1.0.3-2  luci-lib-taskd 1.0.26  luci-lib-xterm 4.18.0
+#    script-utils  coreutils-stty（后两个来自 lede 官方源）
+# =============================================================================
+name: Package N1 & X96Max+ (with iStore, unified menu)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "内核系列（6.1.y=自动取该系列最新）"
+        required: false
+        default: "6.1.y"
+      openwrt_ver:
+        description: "固件版本号"
+        required: false
+        default: "R24.1.13"
+      openwrt_ip:
+        description: "默认 LAN IP"
+        required: false
+        default: "192.168.1.1"
+      gzip_imgs:
+        description: "镜像压缩方式"
+        required: false
+        default: "gz"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: istore-package
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: 打包固件（含 iStore + 统一菜单）
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Checkout（取本地化脚本与资源）
+        uses: actions/checkout@v4
+
+      - name: 安装依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y btrfs-progs dosfstools e2fsprogs util-linux uuid-runtime \
+            fdisk parted gawk tar pigz p7zip-full rsync wget curl jq xz-utils
+
+      - name: 准备依赖包（iStore + taskd 等）
+        run: |
+          set -e
+          mkdir -p pkg
+          BASE="https://istore.istoreos.com/repo/all/store"
+          LEDE="https://mirrors.tencent.com/lede/releases/24.10.3/packages/aarch64_generic"
+          # iStore 商店（all 架构，跨平台）
+          for f in luci-app-store_0.2.1-r1_all.ipk \
+                   taskd_1.0.3-2_all.ipk \
+                   luci-lib-taskd_1.0.26_all.ipk \
+                   luci-lib-xterm_4.18.0_all.ipk; do
+            echo "下载 $f"
+            curl -fSL --retry 3 "$BASE/$f" -o "pkg/$f"
+          done
+          # lede 官方依赖（按需调整版本号，用 opkg 索引核对）
+          for f in $(curl -fsSL "$LEDE/base/Packages.gz" | gunzip | \
+                     awk '/^Package: script-utils$/{f=1} f&&/^Filename:/{print $2; exit}'); do
+            curl -fSL --retry 3 "$LEDE/../$f" -o "pkg/$(basename $f)" 2>/dev/null || true
+          done
+          ls -lh pkg/
+
+      - name: 解包 rootfs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          rel=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                 "https://api.github.com/repos/ophub/flippy-openwrt-actions/releases?per_page=30" \
+               | jq -r '[.[] | select(.tag_name != "v0.1.0")
+                        | {tag:.tag_name,
+                           a:(.assets[]|select(.name|test("rootfs"))|{n:.name,u:.url})}
+                        | select(.a != null)]
+                    | sort_by(.a.n) | reverse | .[0]')
+          url=$(echo "$rel" | jq -r '.a.u')
+          name=$(echo "$rel" | jq -r '.a.n')
+          echo "rootfs: $name"
+          mkdir -p opt/download
+          curl -fSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+               "$url" -o "opt/download/$name"
+          echo "ROOTFS=$name" >> $GITHUB_ENV
+          rm -rf rw && mkdir rw
+          tar xzf "opt/download/$name" -C rw
+          echo "解包完成，根目录："
+          ls rw | head
+
+      - name: 注入 iStore 软件源与预装包
+        run: |
+          set -e
+          ROOT=$(ls -d rw/*/ 2>/dev/null | head -1)
+          [ -d "$ROOT" ] || ROOT="rw/"
+          echo "rootfs 根目录: $ROOT"
+
+          # 1) 追加 iStore 源
+          echo "src/gz istore https://istore.istoreos.com/repo/all/store" \
+            >> "$ROOT/etc/opkg/distfeeds.conf"
+
+          # 2) 预装 ipk（ar x 解出 data.tar.gz 再解到 rootfs）
+          for ipk in pkg/*.ipk; do
+            [ -e "$ipk" ] || continue
+            echo "--- 解包 $ipk"
+            rm -rf /tmp/ipk && mkdir -p /tmp/ipk
+            ( cd /tmp/ipk && ar x "$OLDPWD/$ipk" 2>/dev/null || tar xzf "$OLDPWD/$ipk" 2>/dev/null )
+            if [ -f /tmp/ipk/data.tar.gz ]; then
+              tar xzf /tmp/ipk/data.tar.gz -C "$ROOT"
+            elif [ -f /tmp/ipk/data.tar ]; then
+              tar xf  /tmp/ipk/data.tar  -C "$ROOT"
+            fi
+            # 处理 control（postinst 可能需要，这里只保留文件，配置交由首次启动生成）
+            [ -f /tmp/ipk/control.tar.gz ] && tar xzf /tmp/ipk/control.tar.gz -C "$ROOT" || true
+          done
+          echo "注入完成"
+          ls "$ROOT/usr/lib/lua/luci/controller/store.lua" 2>/dev/null || echo "⚠️store.lua 未找到"
+
+      - name: 修正 iStore 菜单层级（挂到系统下）
+        run: |
+          set -e
+          ROOT=$(ls -d rw/*/ 2>/dev/null | head -1); [ -d "$ROOT" ] || ROOT="rw/"
+          F="$ROOT/usr/lib/lua/luci/controller/store.lua"
+          if [ -f "$F" ]; then
+            echo "修正前 admin/store 出现次数: $(grep -c '"admin", "store"' "$F")"
+            sed -i 's|{"admin", "store"|{"admin", "system", "store"|g' "$F"
+            echo "修正后新路径次数: $(grep -c '"admin", "system", "store"' "$F")"
+            # 保留原文件备份，便于回溯
+            cp "$F" "$F.orig"
+          else
+            echo "::warning::未找到 store.lua，跳过"
+          fi
+          # 预置首次启动脚本（清 LuCI 缓存让新菜单生效）
+          mkdir -p "$ROOT/etc/uci-defaults"
+          cat > "$ROOT/etc/uci-defaults/99-istore-menu" <<'EOF'
+#!/bin/sh
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null
+exit 0
+EOF
+          chmod +x "$ROOT/etc/uci-defaults/99-istore-menu"
+
+      - name: 重新打包 rootfs
+        run: |
+          set -e
+          ROOT=$(ls -d rw/*/ 2>/dev/null | head -1); [ -d "$ROOT" ] || ROOT="rw/"
+          OUT="opt/download/$ROOTFS"
+          rm -f "$OUT"
+          tar czf "$OUT" -C "$ROOT" .
+          ls -lh "$OUT"
+
+      - name: 调用 F大脚本打包固件
+        id: package
+        env:
+          OPENWRT_ARMSR: opt/download/${{ env.ROOTFS }}
+          PACKAGE_SOC: s905x3_s905d
+          KERNEL_REPO_URL: ophub/kernel
+          KERNEL_VERSION_NAME: ${{ inputs.kernel_version }}
+          KERNEL_AUTO_LATEST: 'true'
+          OPENWRT_IP: ${{ inputs.openwrt_ip }}
+          GZIP_IMGS: ${{ inputs.gzip_imgs }}
+          WHOAMI: Haiibo
+        run: |
+          set -o pipefail
+          chmod -R +x flippy-vendor/openwrt_flippy.sh flippy-vendor/openwrt_packit/files 2>/dev/null || true
+          rm -rf openwrt_packit && cp -r flippy-vendor/openwrt_packit openwrt_packit
+          cp "opt/download/$ROOTFS" "openwrt_packit/openwrt-armsr-armv8-generic-rootfs.tar.gz"
+          bash flippy-vendor/openwrt_flippy.sh
+
+      - name: 收集产物
+        run: |
+          mkdir -p firmware
+          cp -v "${PACKAGED_OUTPUTPATH}"/*.img.gz firmware/ 2>/dev/null || true
+          [ -z "$(ls -A firmware 2>/dev/null)" ] && { echo "::error::无产出"; exit 1; }
+          cd firmware
+          for f in *flippy*.img.gz; do
+            [ -e "$f" ] || continue
+            n=$(echo "$f" | sed -E 's/-flippy-[0-9]+[^.]*//')
+            [ "$f" != "$n" ] && mv -v "$f" "$n"
+          done
+          sha256sum ./*.img.gz > sha256sums.txt 2>/dev/null || true
+          ls -lh
+
+      - name: 发布
+        uses: ncipollo/release-action@v1
+        with:
+          tag: N1-X96MaxPlus-iStore
+          name: "OpenWrt for N1 & X96Max+（含 iStore 商店，菜单已统一）"
+          allowUpdates: true
+          removeArtifacts: true
+          artifacts: firmware/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### 本次打包
+            - 基于 F大官方 rootfs（ophub）
+            - **已预装 iStore 应用商店**，并把菜单从顶层移到 **系统** 下面，与其它插件层级一致
+            - 内核：`${{ inputs.kernel_version }}`（ophub/kernel）
+            - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
+
+            ### 注意
+            iStore 商店**自更新 luci-app-store 后会还原菜单层级**（回到顶层），
+            如需再次统一，重跑本 workflow 或手动执行：
+            ```
+            sed -i 's|{"admin", "store"|{"admin", "system", "store"|g' \
+              /usr/lib/lua/luci/controller/store.lua
+            rm -rf /tmp/luci-*cache && /etc/init.d/uhttpd restart
+            ```
