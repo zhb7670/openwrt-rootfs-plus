@@ -88,15 +88,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LOCAL_FILE: ${{ inputs.rootfs_file }}
         run: |
-          set -uo pipefail
+          # 注意：不写 set -u。用 $GITHUB_ENV 传的值要到【下一个 step】才注入环境，
+          # 当前 step 里直接引用 $ROOTFS_NAME 会报 "unbound variable"（实测踩过）。
+          set -o pipefail
           mkdir -p opt/download
+
+          RF_NAME=""
+          RF_TAG=""
 
           if [ -n "$LOCAL_FILE" ]; then
             echo "使用本仓库 Release 的 rootfs: $LOCAL_FILE"
             url="https://github.com/${{ github.repository }}/releases/download/ROOTFS/$LOCAL_FILE"
             curl -fSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" \
                  "$url" -o "opt/download/$LOCAL_FILE"
-            echo "ROOTFS_NAME=$LOCAL_FILE" >> $GITHUB_ENV
+            RF_NAME="$LOCAL_FILE"
           else
             echo "从 ophub 官方查找最新 rootfs…"
             API="https://api.github.com/repos/ophub/flippy-openwrt-actions/releases?per_page=30"
@@ -108,24 +113,29 @@ jobs:
                                       |{name:.name,url:.url,size:.size,updated:.updated_at})}
                           | select(.asset != null)]
                     | sort_by(.asset.updated) | reverse | .[0]')
-            [ -z "$rel" ] || [ "$rel" = "null" ] && { echo "::error::未找到 rootfs"; exit 1; }
+            if [ -z "$rel" ] || [ "$rel" = "null" ]; then
+              echo "::error::未找到 rootfs"; exit 1
+            fi
 
-            name=$(echo "$rel" | jq -r '.asset.name')
+            RF_NAME=$(echo "$rel" | jq -r '.asset.name')
             url=$(echo "$rel" | jq -r '.asset.url')
-            tag=$(echo "$rel" | jq -r '.tag')
-            echo "官方 rootfs: $tag / $name"
+            RF_TAG=$(echo "$rel" | jq -r '.tag')
+            echo "官方 rootfs: $RF_TAG / $RF_NAME"
             curl -fSL --retry 3 --retry-delay 5 \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/octet-stream" \
-              "$url" -o "opt/download/$name"
-            echo "ROOTFS_NAME=$name" >> $GITHUB_ENV
-            echo "ROOTFS_TAG=$tag"   >> $GITHUB_ENV
+              "$url" -o "opt/download/$RF_NAME"
           fi
 
+          # 校验（在当前 step 内用本地变量，不依赖 GITHUB_ENV）
           ls -lh opt/download/
-          sz=$(stat -c%s "opt/download/$ROOTFS_NAME")
+          sz=$(stat -c%s "opt/download/$RF_NAME")
           [ "$sz" -gt 10485760 ] || { echo "::error::rootfs 过小($sz)"; exit 1; }
-          gzip -t "opt/download/$ROOTFS_NAME" || echo "::warning::gzip 校验未通过"
+          gzip -t "opt/download/$RF_NAME" || echo "::warning::gzip 校验未通过"
+
+          # 传给后续 step
+          echo "ROOTFS_NAME=$RF_NAME" >> $GITHUB_ENV
+          echo "ROOTFS_TAG=$RF_TAG"   >> $GITHUB_ENV
 
       # ------------------------------------------------------------------
       # 用【本地化的】openwrt_flippy.sh 打包
@@ -146,7 +156,8 @@ jobs:
           OPENWRT_VER: ${{ inputs.openwrt_ver }}
           DISTRIB_REVISION: ${{ inputs.openwrt_ver }}
         run: |
-          set -uo pipefail
+          # 不用 set -u：env 注入的变量在个别情况下可能未定义，避免整步失败
+          set -o pipefail
           chmod +x flippy-vendor/openwrt_flippy.sh 2>/dev/null || true
           chmod -R +x flippy-vendor/openwrt_packit/files 2>/dev/null || true
 
