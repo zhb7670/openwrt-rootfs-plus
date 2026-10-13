@@ -145,12 +145,11 @@ jobs:
           set -e
           ROOT=$(ls -d rw/*/ 2>/dev/null | head -1); [ -d "$ROOT" ] || ROOT="rw/"
           mkdir -p "$ROOT/etc/uci-defaults"
-          cat > "$ROOT/etc/uci-defaults/99-luci-refresh" <<'EOF'
-#!/bin/sh
-rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null
-exit 0
-EOF
+          # 用 printf 而非 heredoc：heredoc 内容若不缩进会破坏 YAML 块结构
+          printf '#!/bin/sh\nrm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null\nexit 0\n' \
+            > "$ROOT/etc/uci-defaults/99-luci-refresh"
           chmod +x "$ROOT/etc/uci-defaults/99-luci-refresh"
+          cat "$ROOT/etc/uci-defaults/99-luci-refresh"
 
       - name: 重新打包 rootfs
         run: |
