@@ -1,0 +1,211 @@
+# =============================================================================
+#  用 F大官方 rootfs 打包 N1 + X96Max+ 固件
+#
+#  原理（学习自 ophub/flippy-openwrt-actions）：
+#    flippy 脚本本身【不编译任何东西】，它只做三件事：
+#      1) 下载/拷贝 rootfs.tar.gz（OPENWRT_ARMSR 指向的文件，原样 cp 成 PACKAGE_FILE）
+#      2) 下载 F大内核（KERNEL_REPO_URL + KERNEL_VERSION_NAME）
+#      3) 把 rootfs + 内核 组装成 Amlogic 刷机镜像
+#    所以只要给它一份 rootfs，就能得到固件 —— 不需要全量编译 OpenWrt。
+#
+#  关键点：
+#    - 用 ubuntu-26.04-arm 跑"F大官方版"的同款原生 ARM runner（无交叉编译）
+#    - F大最新 rootfs：OpenWrt_armv8_save_2026.10（2026-10-01，443.6MB）
+#    - rootfs 文件名已与 flippy 的 PACKAGE_FILE 完全一致，无需改名
+#    - PACKAGE_SOC=s905x3_s905d 一次产出两个机型：
+#        s905x3 -> X96Max+ / HK1 / H96 Max X3 / TX3 …
+#        s905d  -> 斐讯 N1
+#
+#  可选：指定自定义 rootfs（自己编译或替换过的）
+# =============================================================================
+name: Package N1 & X96Max+ (rootfs + flippy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rootfs_tag:
+        description: "F大 rootfs 的 release tag（留空=自动取最新）"
+        required: false
+        default: ""
+      kernel_version:
+        description: "内核系列（6.1.y=自动取该系列最新；也可 6.12.y）"
+        required: false
+        default: "6.1.y"
+      openwrt_ver:
+        description: "固件版本号（决定产物文件名）"
+        required: false
+        default: "R24.1.13"
+      openwrt_ip:
+        description: "默认 LAN IP"
+        required: false
+        default: "192.168.1.1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rootfs-plus-package
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    name: 打包 N1 + X96Max+
+    # F大官方版用的是 ARM 原生 runner；若无此 runner，回退到 x64
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装打包依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y btrfs-progs dosfstools e2fsprogs util-linux uuid-runtime \
+            fdisk parted gawk tar pigz p7zip-full rsync wget curl jq
+
+      # ------------------------------------------------------------------
+      # 关键：解析要用的 rootfs URL
+      #   优先用用户指定的 tag，否则自动取 ophub 仓库里rootfs 资产最新的那个
+      # ------------------------------------------------------------------
+      - name: 解析 rootfs 下载地址
+        id: rootfs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          USER_TAG: ${{ inputs.rootfs_tag }}
+        run: |
+          set -uo pipefail
+          API="https://api.github.com/repos/ophub/flippy-openwrt-actions/releases"
+
+          if [ -n "$USER_TAG" ]; then
+            echo "使用指定 tag: $USER_TAG"
+            rel=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+                     -H "Authorization: Bearer $GH_TOKEN" "$API/tags/$USER_TAG")
+          else
+            echo "自动查找最新 rootfs…"
+            rel=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+                     -H "Authorization: Bearer $GH_TOKEN" \
+                     "$API?per_page=30" \
+                   | jq -r '[.[] | select(.tag_name != "v0.1.0")
+                            | {tag: .tag_name, asset: (.assets[]
+                               | select(.name|test("rootfs"))
+                               | {name:.name, url:.url, size:.size, updated:.updated_at})}
+                          | select(.asset != null)]
+                    | sort_by(.asset.updated) | reverse | .[0]')
+          fi
+
+          if [ -z "$rel" ] || [ "$rel" = "null" ]; then
+            echo "::error::未能解析 rootfs，请检查 tag 或 API"
+            exit 1
+          fi
+
+          if [ -n "$USER_TAG" ]; then
+            tag=$(echo "$rel" | jq -r '.tag_name')
+            url=$(echo "$rel" | jq -r '.assets[] | select(.name|test("rootfs")) | .url' | head -1)
+            name=$(echo "$rel" | jq -r '.assets[] | select(.name|test("rootfs")) | .name' | head -1)
+            size=$(echo "$rel" | jq -r '.assets[] | select(.name|test("rootfs")) | .size' | head -1)
+          else
+            tag=$(echo "$rel" | jq -r '.tag')
+            url=$(echo "$rel" | jq -r '.asset.url')
+            name=$(echo "$rel" | jq -r '.asset.name')
+            size=$(echo "$rel" | jq -r '.asset.size')
+          fi
+
+          if [ -z "$url" ] || [ "$url" = "null" ]; then
+            echo "::error::该 release 下没有 rootfs 资产"
+            exit 1
+          fi
+
+          echo "tag       : $tag"
+          echo "文件名    : $name"
+          echo "大小      : $((size/1024/1024)) MB"
+          echo "URL       : $url"
+          echo "ROOTFS_TAG=$tag"   >> $GITHUB_ENV
+          echo "ROOTFS_NAME=$name" >> $GITHUB_ENV
+          echo "ROOTFS_URL=$url"   >> $GITHUB_ENV
+
+      - name: 下载 rootfs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /builder/opt/download
+          echo "下载 $ROOTFS_NAME …"
+          curl -fSL --retry 3 --retry-delay 5 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            "$ROOTFS_URL" \
+            -o "/builder/opt/download/$ROOTFS_NAME"
+          ls -lh "/builder/opt/download/"
+          # 校验：必须是有效 gzip 且 > 10MB
+          sz=$(stat -c%s "/builder/opt/download/$ROOTFS_NAME")
+          [ "$sz" -gt 10485760 ] || { echo "::error::文件过小，可能下载失败"; exit 1; }
+          gzip -t "/builder/opt/download/$ROOTFS_NAME" || { echo "::warning::gzip 校验未通过（可能仍可用）"; }
+
+      - name: 调用 F大打包脚本
+        id: package
+        uses: ophub/flippy-openwrt-actions@main
+        env:
+          # ★ flippy 只cp 不生成：OPENWRT_ARMSR 指向的文件会被原样复制成
+          #   PACKAGE_FILE=openwrt-armsr-armv8-generic-rootfs.tar.gz
+          OPENWRT_ARMSR: /builder/opt/download/${{ env.ROOTFS_NAME }}
+          # s905x3 -> X96Max+/HK1/H96 Max X3/TX3；s905d -> 斐讯 N1
+          PACKAGE_SOC: s905x3_s905d
+          KERNEL_REPO_URL: ophub/kernel
+          KERNEL_VERSION_NAME: ${{ inputs.kernel_version }}
+          KERNEL_AUTO_LATEST: 'true'
+          OPENWRT_IP: ${{ inputs.openwrt_ip }}
+          WHOAMI: Haiibo
+          OPENWRT_VER: ${{ inputs.openwrt_ver }}
+          DISTRIB_REVISION: ${{ inputs.openwrt_ver }}
+          GZIP_IMGS: gz
+
+      - name: 收集产物并整理文件名
+        run: |
+          mkdir -p firmware
+          cp -v "${PACKAGED_OUTPUTPATH}"/*.img.gz firmware/ 2>/dev/null || true
+          if [ -z "$(ls -A firmware)" ]; then
+            echo "::error::没有产出镜像，请翻日志找报错"
+            exit 1
+          fi
+          cd firmware
+          # F大内核版本串带 -flippy-NN+o，只改【文件名】不动内容
+          for f in *flippy*.img.gz; do
+            [ -e "$f" ] || continue
+            n=$(echo "$f" | sed -E 's/-flippy-[0-9]+[^.]*//')
+            [ "$f" != "$n" ] && mv -v "$f" "$n"
+          done
+          rm -f ./*.sha256 2>/dev/null || true
+          sha256sum ./*.img.gz > sha256sums.txt 2>/dev/null || true
+          ls -lh
+
+      - name: 发布到 Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: N1-X96MaxPlus-RootfsPlus
+          name: "OpenWrt forN1 & X96Max+（F大 rootfs ${{ env.ROOTFS_TAG }}）"
+          allowUpdates: true
+          removeArtifacts: true
+          artifactErrorsFailBuild: false
+          artifacts: firmware/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### 本次打包
+            - rootfs 来源: **ophub/flippy-openwrt-actions**（F大官方）
+            - rootfs tag: `${{ env.ROOTFS_TAG }}`
+            - 内核: `${{ inputs.kernel_version }}`（自动取同系列最新，F大 ophub/kernel）
+            - 目标机型:
+              - `s905d` → 斐讯 N1
+              - `s905x3` → X96Max+ / HK1 / H96 Max X3 / TX3 等
+            - 默认地址/密码: `${{ inputs.openwrt_ip }}` / password
+
+            ### 说明
+            本固件**未全量编译 OpenWrt**，直接采用 F大官方发布的 rootfs
+            （已含完整插件集）套用 F大内核打包而成，因此速度快、稳定性高。
+
+            ### 刷机
+            U盘启动 → 系统 → 晶晨宝盒 → 安装 OpenWrt → 选择对应 img
