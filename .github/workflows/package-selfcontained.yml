@@ -1,0 +1,209 @@
+# =============================================================================
+#  自包含固件打包（N1 + X96Max+）—— 零外部依赖，可DIY
+#
+#  【为什么要自包含】
+#   flippy 打包脚本运行时依赖 3 个外部仓库：
+#     github.com/ophub/flippy-openwrt-actions  ← action 本体
+#     github.com/unifreq/openwrt_packit        ← 打包实现（脚本会 git clone）
+#     github.com/ophub/kernel                   ← 内核
+#   任何一挂了，打包立刻失败。本仓库把前两个【已本地化】：
+#     flippy-vendor/openwrt_flippy.sh    ← 打包脚本（720行，可自行修改）
+#     flippy-vendor/openwrt_packit/      ← 打包实现（files/ 94MB，含 u-boot 等）
+#   只剩内核依赖 ophub/kernel（正常情况不会挂，且可换REPO_URL）。
+#
+#  【DIY 点 —— 脚本与资源都在本仓库，可自由修改】
+#   1. 改打包逻辑      → 编辑 flippy-vendor/openwrt_flippy.sh
+#   2. 改默认 IP/压缩  → 修改下方 env（OPENWRT_IP / GZIP_IMGS）
+#   3. 加机型          → 修改 PACKAGE_SOC
+#   4. 预置 rootfs     → 把 rootfs.tar.gz 上传到 Release，
+#                        然后把下面 inputs.rootfs_file 填成它的资产名，即可离线打包
+#
+#  【rootfs 来源优先级】
+#   1. inputs.rootfs_file非空 → 从本仓库 Release 下载（完全离线，推荐长期使用）
+#   2. 否则                → 从 ophub 官方下载最新（在线，需网络）
+# =============================================================================
+name: Package N1 & X96Max+ (self-contained)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rootfs_file:
+        description: "本仓库 Release 里的 rootfs 资产名（留空=从 ophub 在线取最新）"
+        required: false
+        default: ""
+      kernel_version:
+        description: "内核系列（6.1.y=自动取该系列最新）"
+        required: false
+        default: "6.1.y"
+      openwrt_ver:
+        description: "固件版本号（决定产物文件名）"
+        required: false
+        default: "R24.1.13"
+      openwrt_ip:
+        description: "默认 LAN IP"
+        required: false
+        default: "192.168.1.1"
+      gzip_imgs:
+        description: "镜像压缩方式"
+        required: false
+        default: "gz"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: selfcontained-package
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    name: 打包 N1 + X96Max+（自包含）
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout（含本地化脚本与打包资源）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装打包依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y btrfs-progs dosfstools e2fsprogs util-linux uuid-runtime \
+            fdisk parted gawk tar pigz p7zip-full rsync wget curl jq
+
+      # ------------------------------------------------------------------
+      # 准备 rootfs
+      #   优先用本仓库 Release 里的（离线可用）；
+      #   否则从 ophub 官方取最新。
+      # ------------------------------------------------------------------
+      - name: 准备 rootfs
+        id: rootfs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOCAL_FILE: ${{ inputs.rootfs_file }}
+        run: |
+          set -uo pipefail
+          mkdir -p opt/download
+
+          if [ -n "$LOCAL_FILE" ]; then
+            echo "使用本仓库 Release 的 rootfs: $LOCAL_FILE"
+            url="https://github.com/${{ github.repository }}/releases/download/ROOTFS/$LOCAL_FILE"
+            curl -fSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" \
+                 "$url" -o "opt/download/$LOCAL_FILE"
+            echo "ROOTFS_NAME=$LOCAL_FILE" >> $GITHUB_ENV
+          else
+            echo "从 ophub 官方查找最新 rootfs…"
+            API="https://api.github.com/repos/ophub/flippy-openwrt-actions/releases?per_page=30"
+            rel=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+                     -H "Authorization: Bearer $GH_TOKEN" "$API" \
+                   | jq -r '[.[] | select(.tag_name != "v0.1.0")
+                            | {tag:.tag_name,
+                               asset:(.assets[]|select(.name|test("rootfs"))
+                                      |{name:.name,url:.url,size:.size,updated:.updated_at})}
+                          | select(.asset != null)]
+                    | sort_by(.asset.updated) | reverse | .[0]')
+            [ -z "$rel" ] || [ "$rel" = "null" ] && { echo "::error::未找到 rootfs"; exit 1; }
+
+            name=$(echo "$rel" | jq -r '.asset.name')
+            url=$(echo "$rel" | jq -r '.asset.url')
+            tag=$(echo "$rel" | jq -r '.tag')
+            echo "官方 rootfs: $tag / $name"
+            curl -fSL --retry 3 --retry-delay 5 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              "$url" -o "opt/download/$name"
+            echo "ROOTFS_NAME=$name" >> $GITHUB_ENV
+            echo "ROOTFS_TAG=$tag"   >> $GITHUB_ENV
+          fi
+
+          ls -lh opt/download/
+          sz=$(stat -c%s "opt/download/$ROOTFS_NAME")
+          [ "$sz" -gt 10485760 ] || { echo "::error::rootfs 过小($sz)"; exit 1; }
+          gzip -t "opt/download/$ROOTFS_NAME" || echo "::warning::gzip 校验未通过"
+
+      # ------------------------------------------------------------------
+      # 用【本地化的】openwrt_flippy.sh 打包
+      #   关键：openwrt_packit/ 目录已存在 → 脚本第 300 行 [[ -d ]] 判断为真，
+      #   跳过 git clone，不再依赖 unifreq/openwrt_packit 仓库。
+      # ------------------------------------------------------------------
+      - name: 用本地脚本打包
+        id: package
+        env:
+          OPENWRT_ARMSR: opt/download/${{ env.ROOTFS_NAME }}
+          PACKAGE_SOC: s905x3_s905d
+          KERNEL_REPO_URL: ophub/kernel
+          KERNEL_VERSION_NAME: ${{ inputs.kernel_version }}
+          KERNEL_AUTO_LATEST: 'true'
+          OPENWRT_IP: ${{ inputs.openwrt_ip }}
+          GZIP_IMGS: ${{ inputs.gzip_imgs }}
+          WHOAMI: Haiibo
+          OPENWRT_VER: ${{ inputs.openwrt_ver }}
+          DISTRIB_REVISION: ${{ inputs.openwrt_ver }}
+        run: |
+          set -uo pipefail
+          chmod +x flippy-vendor/openwrt_flippy.sh 2>/dev/null || true
+          chmod -R +x flippy-vendor/openwrt_packit/files 2>/dev/null || true
+
+          echo "===== 本地化资源检查 ====="
+          ls -lh flippy-vendor/openwrt_flippy.sh
+          echo "openwrt_packit/ 存在: $([ -d flippy-vendor/openwrt_packit ] && echo YES || echo NO)"
+          echo "  files/ 文件数: $(ls flippy-vendor/openwrt_packit/files 2>/dev/null | wc -l)"
+
+          # 让脚本找到本地 packit：它默认找 ./openwrt_packit
+          rm -rf openwrt_packit
+          cp -r flippy-vendor/openwrt_packit openwrt_packit
+          # rootfs 放进 packit 目录（脚本会检查 ${SELECT_PACKITPATH}/${PACKAGE_FILE}）
+          cp -v "opt/download/$ROOTFS_NAME" \
+                "openwrt_packit/openwrt-armsr-armv8-generic-rootfs.tar.gz"
+
+          echo "===== 执行打包 ====="
+          bash flippy-vendor/openwrt_flippy.sh
+
+      - name: 收集产物
+        run: |
+          mkdir -p firmware
+          cp -v "${PACKAGED_OUTPUTPATH}"/*.img.gz firmware/ 2>/dev/null || true
+          cp -v "${PACKAGED_OUTPUTPATH}"/*.sha256 firmware/ 2>/dev/null || true
+          if [ -z "$(ls -A firmware 2>/dev/null)" ]; then
+            echo "::error::没有产出镜像，请翻日志"
+            exit 1
+          fi
+          cd firmware
+          for f in *flippy*.img.gz; do
+            [ -e "$f" ] || continue
+            n=$(echo "$f" | sed -E 's/-flippy-[0-9]+[^.]*//')
+            [ "$f" != "$n" ] && mv -v "$f" "$n"
+          done
+          rm -f ./*.sha256 2>/dev/null || true
+          sha256sum ./*.img.gz > sha256sums.txt 2>/dev/null || true
+          ls -lh
+
+      - name: 发布固件到 Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: N1-X96MaxPlus
+          name: "OpenWrt for N1 & X96Max+（自包含打包）"
+          allowUpdates: true
+          removeArtifacts: true
+          artifactErrorsFailBuild: false
+          artifacts: firmware/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### 本次打包
+            -打包脚本: 本仓库 `flippy-vendor/openwrt_flippy.sh`（已本地化，不依赖 unifreq 仓库）
+            - 打包资源: 本仓库 `flippy-vendor/openwrt_packit/`（已本地化）
+            - rootfs: `${{ env.ROOTFS_NAME }}`
+            - 内核: `${{ inputs.kernel_version }}`（ophub/kernel）
+            - 机型:`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
+            - 默认地址/密码: `${{ inputs.openwrt_ip }}` / password
+
+            ### DIY
+            本仓库已包含完整打包脚本与资源，可自行修改后重新触发。
+            把预置的 rootfs 上传到 tag=ROOTFS 的 Release，
+            再在 inputs 填 rootfs_file 即可**完全离线打包**。
