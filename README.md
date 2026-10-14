@@ -53,8 +53,9 @@ flippy-vendor/
 
 ## 定制版固件里注入了什么
 
-`Package N1 & X96Max+ (with iStore + DDNS-GO)` 会在 rootfs 里注入三项定制，
-**刷完即用，不需要任何手工操作**：
+`Package N1 & X96Max+ (with iStore + DDNS-GO)` 会在 rootfs 里注入六项定制，
+**刷完即用，不需要任何手工操作**（完整六项说明见下文
+[「定制版注入了什么」](#定制版注入了什么n1-x96maxplus-istore)）：
 
 | # | 定制项 | 做法 | 相关文件 |
 |---|---|---|---|
@@ -88,6 +89,7 @@ flippy-vendor/
 | ifit 主题的 iStore 图标/颜色 | `istore-bootstrap/96-istore-menu-icon`（`content:"\e903"` / `color:#26C6DA`） |
 | DDNS-GO 的菜单入口与页面 | `ddnsgo-luci/rootfs/usr/lib/lua/luci/...` |
 | DDNS-GO 的启用钩子 | `ddnsgo-luci/zz-ddnsgo-luci` |
+| 应用数据/下载目录的落点（默认数据分区） | `system-fixes/95-shared-datadir` |
 
 改完直接重新触发 workflow 即可生效。
 
@@ -115,6 +117,7 @@ flippy-vendor/
 | C | DDNS-GO 的 LuCI 入口 | `ddnsgo-luci/` + `/etc/uci-defaults/zz-ddnsgo-luci` | 官方包用 `menu.d` 新架构，本固件的 `createindex()` 只扫 `controller/*.lua`，菜单天生不出现 |
 | D | **无线路径自愈** | `/etc/hotplug.d/ieee80211/05-wifi-path-fix` | 见下 |
 | E | **ifit 样式表版本后缀** | `/etc/uci-defaults/98-ifit-css-cachebust` | 见下 |
+| F | **应用数据目录自愈** | `/etc/hotplug.d/block/95-shared-datadir` | 见下 |
 
 ### D. 无线路径自愈（内核 6.x 的坑）
 
@@ -144,6 +147,37 @@ uhttpd 只发 `ETag` / `Last-Modified`，**不发 `Cache-Control` / `Expires`**�
 于是补丁明明生效了，用户看到的还是旧界面。
 
 钩子给 `header.htm` 里的 `<link ... style.css>` 加上 `?v=<css 的 mtime>`，URL 一变浏览器必然重拉。
+
+### F. 应用数据目录自愈（根分区被灌满的坑）
+
+根分区（`ROOTFS`）只有 **1.25GB**，而镜像本身就自带约 **600MB**
+（OpenList 136M、dockerd 70M、rclone 68M、containerd 45M、sing-box 42M、gost 35M、
+node 33M、verysync 32M、xray 30M…），**出厂就只剩几十 MB 空闲**。
+开机后从 iStore 装的应用又动辄 200MB 级（`kai_session` 195MB、`linkease-full` 149MB）。
+
+而 iStore 系应用的**出厂默认目录几乎全是错的**：
+
+| 应用 | 出厂默认 | 问题 |
+|---|---|---|
+| aria2 | `/mnt/sda1/aria2` | 路径根本不存在 |
+| transmission | `/opt/transmission` | 在根分区 |
+| baidudrive | 下载路径 `/` | 根分区 |
+| filebrowser | `/tmp` | 内存盘 |
+| kodexplorer | `/opt/kodexplorer` | 在根分区 |
+| verysync / kai | 空 | 落到默认位置 |
+
+`/etc/hotplug.d/block/95-shared-datadir` 在数据分区（`MMC_SHARED`，10~12GB）挂载后，
+把这些目录统一指到 `…/downloads/…` 与 `…/data/…`，并把 `/opt/transmission`、
+`/opt/kodexplorer` 做成指向数据分区的软链（照抄 flippy 已有的 `/opt/docker` 写法）。
+
+> **为什么是 `hotplug.d` 而不是 `uci-defaults`**：`uci-defaults` 在 `/etc/init.d/boot`
+> （START=10）里执行，而挂载数据分区的 `/etc/init.d/fstab` 是 START=11 —— 那时
+> 分区还没挂上，`mkdir` 会把目录建到根分区上（随后被挂载遮住，等于白建）。
+> `block` 的 add 事件才是"分区已就绪"的时刻，`95-` 又排在原生 `10-mount` 之后。
+
+钩子是**幂等**的：只在当前值为空、或为上面这些已知的错误出厂默认值时才改写，
+你在 LuCI 里自己改过的目录一律不动。挂载点按分区标签 `MMC_SHARED` 解析，
+换启动介质导致设备名变化也不会失准。
 
 ---
 

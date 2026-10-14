@@ -1,10 +1,11 @@
 # =============================================================================
-#  在 rootfs 里注入五项定制（不改 F大/海碧 的 rootfs，本地解包后注入，重打包）：
+#  在 rootfs 里注入六项定制（不改 F大/海碧 的 rootfs，本地解包后注入，重打包）：
 #    A. 预装 iStore 应用商店
 #    B. 修复 iStore 在 ifit 主题下的侧边栏菜单（裸文字 → 有图标）
 #    C. 修复 DDNS-GO 的 LuCI 菜单（官方 menu.d 架构在本固件上不显示）
 #    D. 无线自愈：把旧配置里过期的 ffeXXXXX.sd 路径改成 ffeXXXXX.mmc
 #    E. ifit 样式表加版本后缀，避免浏览器启发式缓存导致补丁"看起来没生效"
+#    F. 应用数据自愈：把 iStore 应用的下载/数据目录从 1.25GB 根分区挪到数据分区
 #
 #  做法：
 #    1. 下载 ophub 的 rootfs
@@ -15,7 +16,8 @@
 #    6. 给 ifit 主题补上 iStore 顶层菜单的图标与缩进（否则它在侧边栏是"裸文字"）
 #    7. 预置 DDNS-GO 的老式 LuCI controller + view，并写入启用钩子
 #    8. 写入 /etc/hotplug.d/ieee80211/05-wifi-path-fix（无线路径自愈）
-#    9. 重新打包成 rootfs.tar.gz 交回 flippy 出固件
+#    9. 写入 /etc/hotplug.d/block/95-shared-datadir（应用数据目录自愈）
+#   10. 重新打包成 rootfs.tar.gz 交回 flippy 出固件
 #
 #  ⚠️ D 为什么放 hotplug.d 而不放 uci-defaults：
 #    内核 6.x 把 Amlogic mmc 控制器的 sysfs 名从 ffe03000.sd 改成了 ffe03000.mmc。
@@ -31,6 +33,17 @@
 #    × 10%。老 style.css 的 Last-Modified 是出厂日期，缓存一次能"新鲜"几十天，
 #    期间不回服务器验证 → 补丁明明生效了，用户看到的还是旧界面。
 #    给 <link ... style.css> 加一个随 CSS 内容变化的 ?v= 查询串即可彻底解决。
+#
+#  ⚠️ F 为什么也放 hotplug.d：
+#    根分区（ROOTFS）只有 1.25GB，而且镜像本身就自带 ~600MB（OpenList/dockerd/
+#    rclone/containerd/sing-box/gost/node/verysync/xray...），出厂就只剩几十 MB。
+#    而开机后要装的 iStore 应用动辄 200MB 级（kai_session 195MB、linkease-full 149MB），
+#    应用的下载/数据目录如果指向根分区，一开下载就爆。
+#    这些应用的出厂默认值恰恰都是错的：aria2=/mnt/sda1/aria2（不存在）、
+#    transmission=/opt/transmission（根分区）、baidudrive 下载路径=/（根分区）、
+#    filebrowser=/tmp、kodexplorer=/opt/kodexplorer、verysync 为空。
+#    改这些配置本身只是写字符串，但**建目录**必须在数据分区挂载之后，
+#    所以同样挂 block 的 add 事件（95 > 原生 10-mount）。
 #
 #  ⚠️ 关键历史教训（v1 的 bug，务必不要回退成"解包铺文件"）：
 #    v1 用 `ar x` + `tar xzf data.tar.gz -C $ROOT` 直接把文件铺进 rootfs，
@@ -258,6 +271,14 @@ jobs:
           mkdir -p "$ROOT/etc/hotplug.d/ieee80211"
           install -m 0755 system-fixes/05-wifi-path-fix "$ROOT/etc/hotplug.d/ieee80211/05-wifi-path-fix"
 
+          # 应用数据目录自愈同样放 hotplug.d：
+          # uci-defaults 在 /etc/init.d/boot（START=10）里跑，而挂载数据分区的
+          # /etc/init.d/fstab 是 START=11，那时数据分区还没挂上，
+          # mkdir -p /mnt/<data>/xxx 会把目录建到根分区上（随后被挂载遮住 = 白建）。
+          # block 的 add 事件才是分区就绪的时刻，95 排在原生 10-mount 之后。
+          mkdir -p "$ROOT/etc/hotplug.d/block"
+          install -m 0755 system-fixes/95-shared-datadir "$ROOT/etc/hotplug.d/block/95-shared-datadir"
+
           if [ "${{ inputs.istore_menu }}" = "true" ]; then
             echo "启用：把 iStore 菜单挪到「系统」下面"
             install -m 0755 istore-bootstrap/95-istore-menu-move "$ROOT/etc/uci-defaults/95-istore-menu-move"
@@ -269,14 +290,19 @@ jobs:
           ls -l "$ROOT/etc/uci-defaults/"
           echo "===== 无线自愈钩子 ====="
           ls -l "$ROOT/etc/hotplug.d/ieee80211/"
+          echo "===== block 钩子（应用数据目录自愈）====="
+          ls -l "$ROOT/etc/hotplug.d/block/"
 
           # 兜底：所有首启钩子必须是 LF，否则 #!/bin/sh\r 在设备上直接失效
-          for f in "$ROOT"/etc/uci-defaults/* "$ROOT"/etc/hotplug.d/ieee80211/05-wifi-path-fix; do
+          for f in "$ROOT"/etc/uci-defaults/* \
+                   "$ROOT"/etc/hotplug.d/ieee80211/05-wifi-path-fix \
+                   "$ROOT"/etc/hotplug.d/block/95-shared-datadir; do
             sed -i 's/\r$//' "$f"
           done
           echo "----- shebang 字节检查（应为 #!/bin/sh + LF）-----"
           head -c 12 "$ROOT/etc/uci-defaults/05-istore-bootstrap" | od -c
           head -c 12 "$ROOT/etc/hotplug.d/ieee80211/05-wifi-path-fix" | od -c
+          head -c 12 "$ROOT/etc/hotplug.d/block/95-shared-datadir" | od -c
 
           echo "----- 05-istore-bootstrap -----"
           cat "$ROOT/etc/uci-defaults/05-istore-bootstrap"
@@ -342,14 +368,14 @@ jobs:
               `x.y.y` 表示自动取该系列最新，多个系列用 `_` 分隔）
             - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
             - **产物 = 机型 × 内核系列**：本次为 2 机型 × 2 内核系列 = **4 个镜像**，
-              **四个镜像都已注入下面五项定制**（注入发生在 rootfs 层，所有镜像共用同一份 rootfs）
+              **四个镜像都已注入下面六项定制**（注入发生在 rootfs 层，所有镜像共用同一份 rootfs）
             - **文件名保留上游原始命名**，末尾的 `-flippy-95+o` / `-flippy-95+` 是两支不同的
               内核变体：**`+o` 偏稳、`+` 偏新**（flippy 的两支构建，官方未正式定义，
               社区资料通常说 `+o` 更稳、N1 等盒子更推荐）
                 同一内核系列下：`…k6.12.112-flippy-95+o.img.gz`（带 o）
                               `…k6.18.56-flippy-95+.img.gz`（不带 o）
 
-            ### 已注入的五项定制
+            ### 已注入的六项定制
 
             **① iStore 安装方式（已修正）**
             iStore 不再"解包铺文件"，而是把 6 个官方 ipk 预置到
@@ -397,6 +423,30 @@ jobs:
             浏览器里看到的还是旧界面（按 `Ctrl+Shift+R` 强刷一次才能看到）。
             现由 `/etc/uci-defaults/98-ifit-css-cachebust` 给 `header.htm` 里的
             `<link ... style.css>` 加上 `?v=<css 的 mtime>`，URL 一变浏览器必然重拉。
+
+            **⑥ 应用数据目录自愈（根分区被灌满的根因）**
+            根分区（`ROOTFS`）只有 **1.25GB**，而镜像本身就自带约 **600MB**
+            （OpenList 136M、dockerd 70M、rclone 68M、containerd 45M、sing-box 42M、
+            gost 35M、node 33M、verysync 32M、xray 30M…），**出厂就只剩几十 MB 空闲**。
+            而开机后从 iStore 装的应用动辄 200MB 级（`kai_session` 195MB、
+            `linkease-full` 149MB），只要它们的**下载/数据目录指向根分区**，一开下载就爆。
+            这些应用的出厂默认值恰恰全是错的：
+            `aria2=/mnt/sda1/aria2`（路径根本不存在）、
+            `transmission=/opt/transmission`（根分区）、
+            `baidudrive 下载路径=/`（根分区）、
+            `filebrowser=/tmp`（内存盘）、`kodexplorer=/opt/kodexplorer`（根分区）、
+            `verysync` 为空、`kai` 数据目录为空。
+            现由 `/etc/hotplug.d/block/95-shared-datadir` 在数据分区挂载后，
+            统一把「下载 / 数据」目录指到数据分区（`MMC_SHARED`，10~12GB）：
+            `…/downloads/{aria2,transmission,qbittorrent,baidu}`、
+            `…/data/{transmission,qbittorrent,verysync,kai,baidudrive,filebrowser,kodexplorer,openlist}`，
+            并把 `/opt/transmission`、`/opt/kodexplorer` 做成指向数据分区的软链
+            （照抄 flippy 已有的 `/opt/docker` 写法）。
+            放 `hotplug.d` 而非 `uci-defaults`：`uci-defaults` 在 `/etc/init.d/boot`（START=10）里跑，
+            而挂载数据分区的 `/etc/init.d/fstab` 是 START=11 —— 那时分区还没挂上，
+            `mkdir` 会把目录建到根分区上（随后被挂载遮住，等于白建）。
+            此外它是**幂等**的：只在当前值为空、或为上面这些已知错误出厂默认值时才改写，
+            你在 LuCI 里自己改过的目录一律不动。
 
             ### iStore 菜单位置
             默认保持 iStore 上游原样（`admin/store`，显示在侧边栏顶层）。

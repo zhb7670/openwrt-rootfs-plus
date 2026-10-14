@@ -1,0 +1,98 @@
+#!/bin/sh
+# =============================================================================
+#  F. 应用数据目录自愈：把 iStore 系列应用的「下载 / 共享 / 数据」目录
+#     统一落到数据分区（MMC_SHARED，10~12GB），而不是只有 1.25GB、
+#     出厂就只剩几十 MB 空闲的根分区。
+#
+#  ── 为什么放 /etc/hotplug.d/block 而不放 /etc/uci-defaults ──
+#    /etc/init.d/boot（START=10）跑 uci-defaults，
+#    而负责挂载数据分区的 /etc/init.d/fstab 是 START=11 ——
+#    也就是说 uci-defaults 执行时数据分区**还没挂上**。此时
+#    `mkdir -p /mnt/<data>/downloads/aria2` 会把目录建到**根分区**上，
+#    等数据分区挂上来又把它整个遮住：等于白建，还白占根分区空间。
+#    block 的 add 事件是"分区已就绪"的时刻，且 95 排在原生 10-mount 之后，
+#    所以在这个时刻做事天然安全。
+#
+#  ── 幂等设计 ──
+#    只在「当前值为空」或「当前值是已知的错误出厂默认值」时才改写；
+#    用户在 LuCI 里自己改过的任何值一律不动。
+# =============================================================================
+[ "${ACTION}" = "add" ] || exit 0
+
+# 按分区标签解析挂载点，避免把 /mnt/mmcblk1p4 写死
+# （换启动介质时设备名会变：SD=eMMC 主从顺序不同，挂载点也跟着变）
+D=$(block info 2>/dev/null | sed -n 's/.*LABEL="MMC_SHARED".*MOUNT="\([^"]*\)".*/\1/p' | head -1)
+[ -n "$D" ] || D=/mnt/mmcblk1p4
+DEV=$(block info 2>/dev/null | sed -n 's|^/dev/\([^:]*\):.*LABEL="MMC_SHARED".*|\1|p' | head -1)
+
+# 本事件就是数据分区时，最多等 5 秒（正常情况下 10-mount 已经挂好，立即命中）
+if [ -n "$DEV" ] && [ "$DEVNAME" = "$DEV" ]; then
+    i=0
+    while [ "$i" -lt 5 ]; do
+        grep -q " $D " /proc/mounts && break
+        i=$((i + 1)); sleep 1
+    done
+fi
+grep -q " $D " /proc/mounts || exit 0
+
+mkdir -p \
+    "$D/downloads/aria2" \
+    "$D/downloads/transmission/incomplete" \
+    "$D/downloads/qbittorrent" \
+    "$D/downloads/baidu" \
+    "$D/data/transmission" \
+    "$D/data/qbittorrent" \
+    "$D/data/verysync" \
+    "$D/data/kai" \
+    "$D/data/baidudrive/tmp" \
+    "$D/data/filebrowser" \
+    "$D/data/kodexplorer" \
+    "$D/data/openlist" \
+    "$D/data/ftp" 2>/dev/null
+
+CHANGED=0
+# fixval <uci 路径> <期望值> <"错误出厂默认值"...>   仅当当前值命中后者（或为空）时才改写
+fixval() {
+    _p=$1; _v=$2; shift 2
+    [ -f "/etc/config/$(echo "$_p" | cut -d. -f1)" ] || return 0
+    _cur=$(uci -q get "$_p")
+    [ "$_cur" = "$_v" ] && return 0
+    _bad=0
+    for _b in "$@"; do
+        [ "$_cur" = "$_b" ] && _bad=1
+    done
+    [ "$_bad" = 0 ] && return 0
+    uci -q set "$_p=$_v" && CHANGED=1
+}
+
+# 下载目录
+fixval aria2.main.dir                                "$D/downloads/aria2"                   "" "/mnt/sda1/aria2"
+fixval transmission.@transmission[0].download_dir    "$D/downloads/transmission"            "/opt/transmission/download" "/var/etc/transmission" ""
+fixval transmission.@transmission[0].incomplete_dir  "$D/downloads/transmission/incomplete" "/opt/transmission/incomplete" ""
+fixval baidudrive.@baidudrive[0].download_path       "$D/downloads/baidu"                   "/" "/tmp" ""
+# 应用数据目录
+fixval transmission.@transmission[0].config_dir      "$D/data/transmission"                 "/opt/transmission" "/var/etc/transmission" ""
+fixval verysync.config.profile                       "$D/data/verysync"                     ""
+fixval kai.@kai[0].data_dir                          "$D/data/kai"                          ""
+fixval baidudrive.@baidudrive[0].data_dir            "$D/data/baidudrive"                   ""
+fixval baidudrive.@baidudrive[0].tmp_path            "$D/data/baidudrive/tmp"               ""
+fixval qbittorrent.@qbittorrent[0].profile_dir       "$D/data/qbittorrent"                  "/etc/qbittorrent" ""
+fixval filebrowser.@global[0].project_directory      "$D/data/filebrowser"                  "/tmp" "/etc/filebrowser" ""
+fixval kodexplorer.@global[0].project_directory      "$D/data/kodexplorer"                  "/opt/kodexplorer" ""
+fixval vsftpd.anonymous.root                         "$D/data/ftp"                          "/home/ftp" ""
+
+if [ "$CHANGED" = 1 ]; then
+    uci -q commit
+    logger -t shared-datadir "已把应用的数据/下载目录指向 $D"
+fi
+
+# /opt 下两个惯用目录做成指向数据分区的软链（照抄 flippy 已有的 /opt/docker 写法）。
+# 只在这些名字还不存在时创建；/opt/* 不是 block-mount 的目标，所以不会有"外置盘
+# 挂上来把数据分区遮住"的风险。
+for _n in transmission kodexplorer; do
+    if [ ! -e "/opt/$_n" ] && [ ! -L "/opt/$_n" ]; then
+        ln -s "$D/data/$_n" "/opt/$_n"
+    fi
+done
+
+exit 0
