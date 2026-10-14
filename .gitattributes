@@ -10,3 +10,5 @@
 # 否则 #!/bin/sh\r 在路由器上会直接报 "not found"，首启钩子整段失效。
 istore-bootstrap/** text eol=lf
 ddnsgo-luci/** text eol=lf
+# 系统级修补（无线路径自愈 / ifit 样式表版本后缀），同样必须 LF
+system-fixes/** text eol=lf

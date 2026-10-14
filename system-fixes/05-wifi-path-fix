@@ -1,0 +1,43 @@
+#!/bin/sh
+# ============================================================================
+# 无线自愈：内核对 Amlogic mmc 控制器的 sysfs 命名改过
+#
+#   旧内核（如 6.1.163-flippy-94+o）：platform/soc/ffe03000.sd/mmc_host/...
+#   新内核（如 6.18.56-flippy-95+）： platform/soc/ffe03000.mmc/mmc_host/...
+#
+# 如果 /etc/config/wireless 是从旧系统带过来的（恢复配置备份等），里面写死的
+# 老路径在新内核上永远匹配不到 phy -> radioN 报
+#   "up": false, "retry_setup_failed": true
+# 同时热插拔的 10-wifi-detect 会发现"这颗 phy 没人认领"，自动补一条新 radio，
+# 于是你的 SSID 消失、多出一个 LEDE 开放网络。
+#
+# 为什么放 /etc/hotplug.d/ieee80211/ 而不放 uci-defaults：
+#   uci-defaults 在 /etc/init.d/boot 里执行得太早，那时 SDIO 网卡还没枚举完，
+#   /etc/config/wireless 常常根本不存在。而 hotplug 的 add 事件正是网卡刚上线的
+#   时刻，且在 10-wifi-detect 之前（05 < 10），修完再让 detect 去判重。
+# ============================================================================
+
+[ "${ACTION}" = "add" ] || exit 0
+
+W=/etc/config/wireless
+[ -f "$W" ] || exit 0
+
+# ---- 1) 把过期的 .sd 路径改成 .mmc（不限定具体地址，适配各类 Amlogic 机型）----
+if grep -q 'ffe[0-9a-f]*\.sd/' "$W"; then
+	cp -a "$W" "$W.bak.$(date +%Y%m%d_%H%M%S)"
+	sed -i 's#\(ffe[0-9a-f]*\)\.sd/#\1.mmc/#g' "$W"
+	logger -t wifi-path-fix "已把过期的 .sd 路径修正为 .mmc"
+fi
+
+# ---- 2) 一颗 phy 只能被一个 wifi-device 认领 ----
+# radio1 与 radio0 指向同一设备时，删掉 radio1（它是自动补出来的那个）
+a=$(uci -q get wireless.radio0.path)
+b=$(uci -q get wireless.radio1.path)
+if [ -n "$a" ] && [ "$a" = "$b" ]; then
+	uci -q delete wireless.radio1
+	uci -q delete wireless.default_radio1
+	uci -q commit wireless
+	logger -t wifi-path-fix "radio1 与 radio0 指向同一 phy，已删除 radio1"
+fi
+
+exit 0

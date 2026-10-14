@@ -1,0 +1,38 @@
+#!/bin/sh
+# ============================================================================
+# ifit 样式表加版本后缀，解决"补丁生效了但浏览器还是显示旧的"问题
+#
+# 现象：96-istore-menu-icon 已经把 iStore 的图标规则追加进 style.css，盒子侧
+#       证据全绿（文件变大、规则在、HTTP 200 字节数一致），但浏览器打开还是旧的。
+#
+# 原因：uhttpd 只发 ETag / Last-Modified，**不发 Cache-Control / Expires**。
+#       按 RFC 7234 §4.2.2，浏览器对这类响应做"启发式缓存"，有效期约
+#       (缓存时刻 - Last-Modified) × 10%。老 style.css 的 Last-Modified 是出厂
+#       日期，缓存一次就能"新鲜"几十天，期间根本不回服务器验证。
+#
+# 做法：给 <link ... style.css> 加一个随 CSS 内容变化的查询串。URL 一变，浏览器
+#       必然重新拉取，不用再让用户手动 Ctrl+Shift+R。
+# ============================================================================
+
+H=/usr/lib/lua/luci/view/themes/ifit/header.htm
+C=/www/luci-static/ifit/css/style.css
+
+[ -f "$H" ] || exit 0
+[ -f "$C" ] || exit 0
+
+# 已经有版本后缀就不重复加
+grep -q 'style\.css?v=' "$H" && exit 0
+
+# 用 CSS 文件自身的 mtime 当版本号：每次固件重打包、补丁一变，版本号就跟着变
+V=$(date -r "$C" +%Y%m%d%H%M%S 2>/dev/null)
+[ -n "$V" ] || V=$(date +%Y%m%d%H%M%S)
+
+cp -a "$H" "$H.bak.$(date +%Y%m%d_%H%M%S)"
+sed -i "s#<%=media%>/css/style.css\"#<%=media%>/css/style.css?v=$V\"#" "$H"
+
+# 顺手清一次 LuCI 缓存，避免模板/菜单旧字节码
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+rm -rf /tmp/luci-modulecache
+
+logger -t ifit-css "ifit 样式表已加版本后缀 v=$V"
+exit 0

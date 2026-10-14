@@ -106,6 +106,47 @@ flippy-vendor/
 
 ---
 
+## 定制版注入了什么（`N1-X96MaxPlus-iStore`）
+
+| # | 项目 | 注入位置 | 说明 |
+|---|---|---|---|
+| A | iStore 应用商店 | `/usr/share/istore-bootstrap/` + `/etc/uci-defaults/05-istore-bootstrap` | 6 个 ipk 离线预置，首启用目标系统自带的 opkg 真正安装（**不能直接铺文件**，否则包不登记、软链丢失） |
+| B | iStore 侧边栏图标 | `/etc/uci-defaults/96-istore-menu-icon` | ifit 主题只给"有子菜单"的顶层项硬编码了图标；iStore 是唯一的裸 `<li>`，所以补 3 条 CSS |
+| C | DDNS-GO 的 LuCI 入口 | `ddnsgo-luci/` + `/etc/uci-defaults/zz-ddnsgo-luci` | 官方包用 `menu.d` 新架构，本固件的 `createindex()` 只扫 `controller/*.lua`，菜单天生不出现 |
+| D | **无线路径自愈** | `/etc/hotplug.d/ieee80211/05-wifi-path-fix` | 见下 |
+| E | **ifit 样式表版本后缀** | `/etc/uci-defaults/98-ifit-css-cachebust` | 见下 |
+
+### D. 无线路径自愈（内核 6.x 的坑）
+
+内核把 Amlogic mmc 控制器的 sysfs 名改过：
+
+```
+6.1.x : platform/soc/ffe03000.sd/mmc_host/...      （.sd）
+6.18.x: platform/soc/ffe03000.mmc/mmc_host/...     （.mmc）
+```
+
+如果 `/etc/config/wireless` 是从旧系统带过来的（恢复配置备份），里面写死的老路径在新内核上
+**永远匹配不到 phy** → `radioN` 报 `"up": false, "retry_setup_failed": true`；
+同时 `/etc/hotplug.d/ieee80211/10-wifi-detect` 会以为"这颗 phy 没人认领"，自动补一条
+**`LEDE` 开放网络**顶上来 —— 用户看到的现象就是"我的 WiFi 不见了，多了个不认识的网络"。
+
+钩子做两件事：把 `ffeXXXXX.sd/` 批量改成 `ffeXXXXX.mmc/`；`radio1` 与 `radio0` 路径相同时删掉 `radio1`。
+
+> 为什么用 `hotplug.d` 而不是 `uci-defaults`：`uci-defaults` 在 `/etc/init.d/boot` 里执行得太早，
+> 那时 SDIO 网卡还没枚举完、`/etc/config/wireless` 往往还不存在。`05-` 前缀保证它排在
+> `10-wifi-detect` 之前，先修好路径再让 detect 判重，就不会多补一个 radio。
+
+### E. 样式表版本后缀
+
+uhttpd 只发 `ETag` / `Last-Modified`，**不发 `Cache-Control` / `Expires`**。按 RFC 7234 §4.2.2，
+浏览器会对这类响应做"启发式缓存"，有效期约 `(缓存时刻 − Last-Modified) × 10%`。
+老 `style.css` 的 `Last-Modified` 是出厂日期，缓存一次能"新鲜"几十天，**期间根本不回服务器验证** ——
+于是补丁明明生效了，用户看到的还是旧界面。
+
+钩子给 `header.htm` 里的 `<link ... style.css>` 加上 `?v=<css 的 mtime>`，URL 一变浏览器必然重拉。
+
+---
+
 ## 相关链接
 
 - F大打包 action：https://github.com/ophub/flippy-openwrt-actions

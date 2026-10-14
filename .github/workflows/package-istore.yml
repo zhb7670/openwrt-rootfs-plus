@@ -1,8 +1,10 @@
 # =============================================================================
-#  在 rootfs 里注入三项定制（不改 F大/海碧 的 rootfs，本地解包后注入，重打包）：
+#  在 rootfs 里注入五项定制（不改 F大/海碧 的 rootfs，本地解包后注入，重打包）：
 #    A. 预装 iStore 应用商店
 #    B. 修复 iStore 在 ifit 主题下的侧边栏菜单（裸文字 → 有图标）
 #    C. 修复 DDNS-GO 的 LuCI 菜单（官方 menu.d 架构在本固件上不显示）
+#    D. 无线自愈：把旧配置里过期的 ffeXXXXX.sd 路径改成 ffeXXXXX.mmc
+#    E. ifit 样式表加版本后缀，避免浏览器启发式缓存导致补丁"看起来没生效"
 #
 #  做法：
 #    1. 下载 ophub 的 rootfs
@@ -12,7 +14,23 @@
 #    5.（可选）把 store.lua 菜单从 admin/store 挪到 admin/system/store
 #    6. 给 ifit 主题补上 iStore 顶层菜单的图标与缩进（否则它在侧边栏是"裸文字"）
 #    7. 预置 DDNS-GO 的老式 LuCI controller + view，并写入启用钩子
-#    8. 重新打包成 rootfs.tar.gz 交回 flippy 出固件
+#    8. 写入 /etc/hotplug.d/ieee80211/05-wifi-path-fix（无线路径自愈）
+#    9. 重新打包成 rootfs.tar.gz 交回 flippy 出固件
+#
+#  ⚠️ D 为什么放 hotplug.d 而不放 uci-defaults：
+#    内核 6.x 把 Amlogic mmc 控制器的 sysfs 名从 ffe03000.sd 改成了 ffe03000.mmc。
+#    从旧系统带过来的 /etc/config/wireless 里写死的老路径在新内核上永远匹配不到 phy
+#    → radioN 报 "up": false, "retry_setup_failed": true；同时 10-wifi-detect 会以为
+#    "这颗 phy 没人认领"，自动补一条 LEDE 开放网络顶上来，用户的 SSID 就消失了。
+#    uci-defaults 在 /etc/init.d/boot 里执行得太早（SDIO 网卡还没枚举完，
+#    /etc/config/wireless 往往还不存在），所以必须挂 hotplug 的 add 事件，
+#    并且用 05 前缀排在 10-wifi-detect 之前，先修好再让 detect 判重。
+#
+#  ⚠️ E 的原因：uhttpd 只发 ETag / Last-Modified，**不发 Cache-Control / Expires**。
+#    按 RFC 7234 §4.2.2 浏览器会做"启发式缓存"，有效期约 (缓存时刻 - Last-Modified)
+#    × 10%。老 style.css 的 Last-Modified 是出厂日期，缓存一次能"新鲜"几十天，
+#    期间不回服务器验证 → 补丁明明生效了，用户看到的还是旧界面。
+#    给 <link ... style.css> 加一个随 CSS 内容变化的 ?v= 查询串即可彻底解决。
 #
 #  ⚠️ 关键历史教训（v1 的 bug，务必不要回退成"解包铺文件"）：
 #    v1 用 `ar x` + `tar xzf data.tar.gz -C $ROOT` 直接把文件铺进 rootfs，
@@ -230,6 +248,16 @@ jobs:
           install -m 0755 ddnsgo-luci/zz-ddnsgo-luci "$ROOT/etc/uci-defaults/zz-ddnsgo-luci"
           install -m 0755 istore-bootstrap/99-luci-refresh   "$ROOT/etc/uci-defaults/99-luci-refresh"
 
+          # 98 必须在 96 之后（这时 style.css 已经打过补丁，mtime 才是对的）、99 之前
+          install -m 0755 system-fixes/98-ifit-css-cachebust "$ROOT/etc/uci-defaults/98-ifit-css-cachebust"
+
+          # 无线路径自愈放 hotplug.d 而不放 uci-defaults：
+          # uci-defaults 在 /etc/init.d/boot 里跑得太早，那时 SDIO 网卡还没枚举完、
+          # /etc/config/wireless 往往还不存在。hotplug 的 add 事件才是网卡刚上线的时刻，
+          # 而且 05 排在 10-wifi-detect 之前，修完再让 detect 去判重，就不会多补一个 radio。
+          mkdir -p "$ROOT/etc/hotplug.d/ieee80211"
+          install -m 0755 system-fixes/05-wifi-path-fix "$ROOT/etc/hotplug.d/ieee80211/05-wifi-path-fix"
+
           if [ "${{ inputs.istore_menu }}" = "true" ]; then
             echo "启用：把 iStore 菜单挪到「系统」下面"
             install -m 0755 istore-bootstrap/95-istore-menu-move "$ROOT/etc/uci-defaults/95-istore-menu-move"
@@ -239,11 +267,16 @@ jobs:
 
           echo "===== uci-defaults 内容 ====="
           ls -l "$ROOT/etc/uci-defaults/"
+          echo "===== 无线自愈钩子 ====="
+          ls -l "$ROOT/etc/hotplug.d/ieee80211/"
 
           # 兜底：所有首启钩子必须是 LF，否则 #!/bin/sh\r 在设备上直接失效
-          for f in "$ROOT"/etc/uci-defaults/*; do sed -i 's/\r$//' "$f"; done
+          for f in "$ROOT"/etc/uci-defaults/* "$ROOT"/etc/hotplug.d/ieee80211/05-wifi-path-fix; do
+            sed -i 's/\r$//' "$f"
+          done
           echo "----- shebang 字节检查（应为 #!/bin/sh + LF）-----"
           head -c 12 "$ROOT/etc/uci-defaults/05-istore-bootstrap" | od -c
+          head -c 12 "$ROOT/etc/hotplug.d/ieee80211/05-wifi-path-fix" | od -c
 
           echo "----- 05-istore-bootstrap -----"
           cat "$ROOT/etc/uci-defaults/05-istore-bootstrap"
