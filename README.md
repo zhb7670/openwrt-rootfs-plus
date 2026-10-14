@@ -53,15 +53,16 @@ flippy-vendor/
 
 ## 定制版固件里注入了什么
 
-`Package N1 & X96Max+ (with iStore + DDNS-GO)` 会在 rootfs 里注入六项定制，
-**刷完即用，不需要任何手工操作**（完整六项说明见下文
-[「定制版注入了什么」](#定制版注入了什么n1-x96maxplus-istore)）：
+`Package N1 & X96Max+ (with iStore + DDNS-GO)` 会在 rootfs 里注入五项定制，
+并把**镜像的根分区从 1280MB 扩到 4096MB**，**刷完即用，不需要任何手工操作**
+（完整说明见下文 [「定制版注入了什么」](#定制版注入了什么n1-x96maxplus-istore)）：
 
 | # | 定制项 | 做法 | 相关文件 |
 |---|---|---|---|
 | ① | **iStore 应用商店** | 加源 + 把 6 个官方 ipk 预置到 `/usr/share/istore-bootstrap/`，**首次开机由系统自带 opkg 真正安装** | `05-istore-bootstrap` |
 | ② | **iStore 菜单全主题对齐** | iStore 是全菜单唯一"没有子菜单的顶层项"，LuCI 对它输出裸 `<li><a data-title=...>`，拿不到 `.nav > .slide > a` 的样式 → 改 `header.htm` 让它与普通顶层项同构（`li.slide > a.menu.exit`），再补点击兜底与按主题族的图标 | `96-istore-theme-align` |
 | ③ | **DDNS-GO 的 LuCI 菜单** | rootfs 里 `ddns-go` + `luci-app-ddns-go` 其实都装好了，但官方用 `menu.d/*.json + resources/view/*.js` 新架构，本固件的老式 LuCI 认不了 → 补一个老式 controller + 内嵌 WebUI(:9876) 的 view，并打开 `enabled` | `ddnsgo-luci/` |
+| ★ | **根分区 1280MB → 4096MB** | 改的是**打包参数**（不是 rootfs 内容）：CI 里 clone 上游 `unifreq/openwrt_packit`、把 `ROOTFS_MB` 打补丁成 `4096`、再放进 `/opt` 让它跳过自带的 clone | `.github/workflows/package-istore.yml` |
 
 > ⚠️ **①为什么必须"预置 ipk + 首启用 opkg 装"，而不是直接解包铺文件？**
 > 解包铺文件会**绕过 opkg**，导致：包不进 opkg 数据库（iStore 自升级检测失败）、
@@ -78,7 +79,8 @@ flippy-vendor/
 
 | 想改什么 | 改哪里 |
 |---|---|
-| 打包逻辑（如加机型、改分区） | `flippy-vendor/openwrt_flippy.sh` |
+| 打包逻辑（如加机型） | `flippy-vendor/openwrt_flippy.sh` |
+| **分区尺寸（根分区 ROOTFS_MB）** | `.github/workflows/package-istore.yml` → 「预置并打补丁的 openwrt_packit」那一步（默认 `ROOTFS_MB=4096`，即 4GB） |
 | 引导固件 / 补丁 / 工具 | `flippy-vendor/openwrt_packit/files/` |
 | 默认 LAN IP | workflow 参数 `openwrt_ip` |
 | 支持的机型 | workflow 参数 `PACKAGE_SOC` |
@@ -89,7 +91,7 @@ flippy-vendor/
 | iStore 侧边栏对齐与图标（全主题） | `istore-bootstrap/96-istore-theme-align`（argon 系 `ssr:\e906`、mcat/atmaterial/tomato `advancedtomato:\e018`、ifit 沿用 `HomeLedeIcomoon:\e903` + `#26C6DA`） |
 | DDNS-GO 的菜单入口与页面 | `ddnsgo-luci/rootfs/usr/lib/lua/luci/...` |
 | DDNS-GO 的启用钩子 | `ddnsgo-luci/zz-ddnsgo-luci` |
-| 应用数据/下载目录的落点（默认数据分区） | `system-fixes/95-shared-datadir` |
+| iStore 应用数据 / 下载目录的落点 | **已恢复出厂默认（根分区 p2）**，不再改写。如需像旧版那样统一挪到数据分区，把 `system-fixes/95-shared-datadir` 加回 workflow 的注入列表 |
 
 改完直接重新触发 workflow 即可生效。
 
@@ -117,7 +119,7 @@ flippy-vendor/
 | C | DDNS-GO 的 LuCI 入口 | `ddnsgo-luci/` + `/etc/uci-defaults/zz-ddnsgo-luci` | 官方包用 `menu.d` 新架构，本固件的 `createindex()` 只扫 `controller/*.lua`，菜单天生不出现 |
 | D | **无线路径自愈** | `/etc/hotplug.d/ieee80211/05-wifi-path-fix` | 见下 |
 | E | **样式表版本后缀（全主题）** | `/etc/uci-defaults/98-theme-css-cachebust` | 见下 |
-| F | **应用数据目录自愈** | `/etc/hotplug.d/block/95-shared-datadir` | 见下 |
+| F | ~~应用数据目录自愈~~ | ~~`/etc/hotplug.d/block/95-shared-datadir`~~ | **已取消注入**，见下 |
 
 ### B. iStore 侧边栏对齐（全主题）
 
@@ -178,36 +180,63 @@ uhttpd 只发 `ETag` / `Last-Modified`，**不发 `Cache-Control` / `Expires`**�
 `?v=<该主题 style.css 的 mtime>`，URL 一变浏览器必然重拉。本来就用动态版本号的主题
 （argon_dark 系的 `?v=<%=math.random(1,100000)%>`、design 的 `?v=<%=ver.luciversion%>`）自动跳过。
 
-### F. 应用数据目录自愈（根分区被灌满的坑）
+### ★ 镜像分区扩容：根分区 1280MB → 4096MB
 
-根分区（`ROOTFS`）只有 **1.25GB**，而镜像本身就自带约 **600MB**
-（OpenList 136M、dockerd 70M、rclone 68M、containerd 45M、sing-box 42M、gost 35M、
-node 33M、verysync 32M、xray 30M…），**出厂就只剩几十 MB 空闲**。
-开机后从 iStore 装的应用又动辄 200MB 级（`kai_session` 195MB、`linkease-full` 149MB）。
+刷完机后 `/`（`ROOTFS`，即 p2）是 **4096MB**。
 
-而 iStore 系应用的**出厂默认目录几乎全是错的**：
+| 分区 | 卷标 | 旧 | 新 |
+|---|---|---|---|
+| p1 | `BOOT` | 384MB | 384MB（不变） |
+| p2 | **`ROOTFS`** | **1280MB** | **4096MB** |
+| p3 | `MMC_ROOTFS2` | 1280MB | 1280MB（不变，A/B 备用槽） |
+| p4 | `MMC_SHARED` | 剩余空间 | 剩余空间（16GB 卡上约 9.1GB） |
 
-| 应用 | 出厂默认 | 问题 |
-|---|---|---|
-| aria2 | `/mnt/sda1/aria2` | 路径根本不存在 |
-| transmission | `/opt/transmission` | 在根分区 |
-| baidudrive | 下载路径 `/` | 根分区 |
-| filebrowser | `/tmp` | 内存盘 |
-| kodexplorer | `/opt/kodexplorer` | 在根分区 |
-| verysync / kai | 空 | 落到默认位置 |
+尺寸全部来自 F大打包脚本 `unifreq/openwrt_packit` 里的三个数
+`SKIP_MB=4 / BOOT_MB=384 / ROOTFS_MB=1280`（`mk_s905d_n1.sh`、`mk_s905x3_multi.sh` 各一份）：
 
-`/etc/hotplug.d/block/95-shared-datadir` 在数据分区（`MMC_SHARED`，10~12GB）挂载后，
-把这些目录统一指到 `…/downloads/…` 与 `…/data/…`，并把 `/opt/transmission`、
-`/opt/kodexplorer` 做成指向数据分区的软链（照抄 flippy 已有的 `/opt/docker` 写法）。
+```
+SIZE = SKIP_MB + BOOT_MB + ROOTFS_MB = 1668MB   → 生成的 .img 总大小
+p2   = create_partition 里的 "-1"（占满剩余）    = SIZE − 4 − 384 = 1280MB
+/etc/part_size = "SKIP BOOT ROOTFS" 三列          → 写进 rootfs
+```
 
-> **为什么是 `hotplug.d` 而不是 `uci-defaults`**：`uci-defaults` 在 `/etc/init.d/boot`
-> （START=10）里执行，而挂载数据分区的 `/etc/init.d/fstab` 是 START=11 —— 那时
-> 分区还没挂上，`mkdir` 会把目录建到根分区上（随后被挂载遮住，等于白建）。
-> `block` 的 add 事件才是"分区已就绪"的时刻，`95-` 又排在原生 `10-mount` 之后。
+设备**首次开机**时 `/etc/init.d` 里的 `first_run.sh` 读 `/etc/part_size`，再往盘尾补建
+p3（尺寸 = 第 3 列）与 p4（占满剩余）。所以只要把 `ROOTFS_MB` 改成 `4096`：
+`.img` 变 4484MB、p2 变 4096MB，首启后 p3/p4 自动跟着调整。
 
-钩子是**幂等**的：只在当前值为空、或为上面这些已知的错误出厂默认值时才改写，
-你在 LuCI 里自己改过的目录一律不动。挂载点按分区标签 `MMC_SHARED` 解析，
-换启动介质导致设备名变化也不会失准。
+额外一处：`files/first_run.sh` 里 p3 的尺寸原本**等于**根分区大小（p3 是 A/B 备用槽），
+根分区涨到 4G 后 p3 会白占 4G，所以把它固定回 `ROOTFS2_MiB=1280`，把空间留给 p4 数据区。
+
+> **怎么改到上游脚本的？** 上游是 CI 里 `git clone` 下来的，本来改不到。但主脚本
+> `openwrt_flippy.sh` 的 `init_packit_repo()` 写的是 `cd /opt` 然后
+> `[[ -d openwrt_packit ]] || git clone ...` —— **`/opt/openwrt_packit` 只要已存在就完全跳过 clone**。
+> 于是 workflow 先拉上游、打好补丁、再放进 `/opt`，就让它用了我们这份。
+> 补丁用锚点断言（`assert s.count(...) == 1`）保护；构建末尾还会解压一份产物镜像、
+> 直接读它的分区表，p2 扇区数必须等于 `8388608`（= 4096MiB），否则整个 job 直接失败。
+
+### F. 应用数据目录自愈 —— 已取消注入
+
+旧版固件用过 `/etc/hotplug.d/block/95-shared-datadir`，把 iStore 系应用
+（aria2 / transmission / qbittorrent / verysync / filebrowser / kodexplorer / vsftpd）
+的**下载与数据目录**统一改写到数据分区（`MMC_SHARED`，10~12GB），并把
+`/opt/transmission`、`/opt/kodexplorer` 做成指向数据分区的软链。
+
+那是在「根分区只有 1.25GB、镜像自带程序就占掉 ~600MB、出厂只剩几十 MB」时的兜底。
+现在根分区已经是 **4GB**，而 iStore 应用的**最初安装默认位置本来就是根分区 p2** ——
+所以这一项**不再注入**，应用的数据/下载目录保持出厂默认值：
+
+| 应用 | 出厂默认（现在就是这样） |
+|---|---|
+| aria2 | `/mnt/sda1/aria2` |
+| transmission | `/opt/transmission` |
+| baidudrive | 下载路径 `/` |
+| filebrowser | `/tmp` |
+| kodexplorer | `/opt/kodexplorer` |
+| verysync / kai | 空（由程序自行决定） |
+
+脚本本体仍保留在 `system-fixes/95-shared-datadir` 备查（含「为什么必须挂
+`hotplug.d/block` 而不能放 `uci-defaults`」以及幂等设计的完整说明）；
+要重新启用，把它加回 workflow 的注入列表即可。
 
 ---
 

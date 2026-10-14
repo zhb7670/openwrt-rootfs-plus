@@ -5,7 +5,10 @@
 #    C. 修复 DDNS-GO 的 LuCI 菜单（官方 menu.d 架构在本固件上不显示）
 #    D. 无线自愈：把旧配置里过期的 ffeXXXXX.sd 路径改成 ffeXXXXX.mmc
 #    E. ifit 样式表加版本后缀，避免浏览器启发式缓存导致补丁"看起来没生效"
-#    F. 应用数据自愈：把 iStore 应用的下载/数据目录从 1.25GB 根分区挪到数据分区
+#
+#  另有一项【镜像分区扩容】（改的是打包参数，不是 rootfs 内容）：
+#    G. 根分区 ROOTFS 1280MB → 4096MB。iStore 应用数据因此可以留在
+#       「最初安装时的默认位置」= 根分区 p2，不需要再往数据分区搬。
 #
 #  做法：
 #    1. 下载 ophub 的 rootfs
@@ -16,8 +19,8 @@
 #    6. 给 ifit 主题补上 iStore 顶层菜单的图标与缩进（否则它在侧边栏是"裸文字"）
 #    7. 预置 DDNS-GO 的老式 LuCI controller + view，并写入启用钩子
 #    8. 写入 /etc/hotplug.d/ieee80211/05-wifi-path-fix（无线路径自愈）
-#    9. 写入 /etc/hotplug.d/block/95-shared-datadir（应用数据目录自愈）
-#   10. 重新打包成 rootfs.tar.gz 交回 flippy 出固件
+#    9. 重新打包成 rootfs.tar.gz 交回 flippy 出固件
+#   10. 预置打好补丁的 openwrt_packit 到 /opt，把根分区 ROOTFS 扩到 4096MB
 #
 #  ⚠️ D 为什么放 hotplug.d 而不放 uci-defaults：
 #    内核 6.x 把 Amlogic mmc 控制器的 sysfs 名从 ffe03000.sd 改成了 ffe03000.mmc。
@@ -34,16 +37,34 @@
 #    期间不回服务器验证 → 补丁明明生效了，用户看到的还是旧界面。
 #    给 <link ... style.css> 加一个随 CSS 内容变化的 ?v= 查询串即可彻底解决。
 #
-#  ⚠️ F 为什么也放 hotplug.d：
-#    根分区（ROOTFS）只有 1.25GB，而且镜像本身就自带 ~600MB（OpenList/dockerd/
-#    rclone/containerd/sing-box/gost/node/verysync/xray...），出厂就只剩几十 MB。
-#    而开机后要装的 iStore 应用动辄 200MB 级（kai_session 195MB、linkease-full 149MB），
-#    应用的下载/数据目录如果指向根分区，一开下载就爆。
-#    这些应用的出厂默认值恰恰都是错的：aria2=/mnt/sda1/aria2（不存在）、
-#    transmission=/opt/transmission（根分区）、baidudrive 下载路径=/（根分区）、
-#    filebrowser=/tmp、kodexplorer=/opt/kodexplorer、verysync 为空。
-#    改这些配置本身只是写字符串，但**建目录**必须在数据分区挂载之后，
-#    所以同样挂 block 的 add 事件（95 > 原生 10-mount）。
+#  ⚠️ 旧的 F 项「应用数据目录自愈 95-shared-datadir」已**停止注入**：
+#    它当年存在的原因是根分区（ROOTFS）只有 1.25GB，而镜像自带 ~600MB
+#    （OpenList/dockerd/rclone/containerd/sing-box/gost/node/verysync/xray...），
+#    出厂就只剩几十 MB，iStore 应用一开下载（kai_session 195MB、linkease-full 149MB）就爆。
+#    所以把它把 aria2/transmission/verysync/kodexplorer/filebrowser/vsftpd 等
+#    的下载与数据目录统一改写到数据分区（MMC_SHARED）。
+#    现在根分区已扩到 4GB（见下面的 G 项），装上程序本体后仍有余量，
+#    用户要求 iStore 数据"恢复最初安装时的默认位置"，也就是根分区 p2
+#    → 所以不再改写任何 UCI 路径。脚本本体保留在 system-fixes/95-shared-datadir
+#    备查，需要重新启用时把下面「写入首次启动钩子」里对应的 install 那两行加回来即可。
+#
+#  ⚠️ G 的原理（根分区尺寸到底由谁决定）：
+#    镜像与分区的尺寸**全部**来自 F大打包脚本 unifreq/openwrt_packit 里的三个数：
+#        SKIP_MB=4 / BOOT_MB=384 / ROOTFS_MB=1280        （mk_s905d_n1.sh、
+#                                                         mk_s905x3_multi.sh 各一份）
+#      · SIZE            = SKIP_MB + BOOT_MB + ROOTFS_MB  → 生成的 .img 总大小（=1668MB）
+#      · p2 的大小        = create_partition 的 "-1"（占满剩余）= SIZE − 4 − 384 = 1280MB
+#      · /etc/part_size  = "SKIP BOOT ROOTFS" 三列，被写进 rootfs；
+#                          设备**首次开机**时 /etc/init.d 里的 first_run.sh 读它，
+#                          再往盘尾补建 p3(MMC_ROOTFS2) 与 p4(MMC_SHARED)。
+#    所以只要把 ROOTFS_MB 改成 4096：镜像变 4484MB、p2 变 4096MB、part_size 第 3 列变 4096。
+#    first_run.sh 里 p3 的尺寸原本就等于 ROOTFS_MB（p3 是 A/B 备用槽，照抄 p2 尺寸），
+#    根分区涨到 4G 后 p3 会白占 4G，所以额外把 p3 固定回 1.25G，空间留给 p4 数据区。
+#
+#    上游脚本没法直接改（CI 里是 git clone 下来的），但 openwrt_flippy.sh 的
+#    init_packit_repo() 是 `cd /opt` 后 `[[ -d openwrt_packit ]] || git clone ...`
+#    —— 也就是说 **/opt/openwrt_packit 已存在就不会去 clone**。
+#    于是 workflow 里先拉上游、打好补丁、再放进 /opt，就能让它用我们这份。
 #
 #  ⚠️ 关键历史教训（v1 的 bug，务必不要回退成"解包铺文件"）：
 #    v1 用 `ar x` + `tar xzf data.tar.gz -C $ROOT` 直接把文件铺进 rootfs，
@@ -271,13 +292,9 @@ jobs:
           mkdir -p "$ROOT/etc/hotplug.d/ieee80211"
           install -m 0755 system-fixes/05-wifi-path-fix "$ROOT/etc/hotplug.d/ieee80211/05-wifi-path-fix"
 
-          # 应用数据目录自愈同样放 hotplug.d：
-          # uci-defaults 在 /etc/init.d/boot（START=10）里跑，而挂载数据分区的
-          # /etc/init.d/fstab 是 START=11，那时数据分区还没挂上，
-          # mkdir -p /mnt/<data>/xxx 会把目录建到根分区上（随后被挂载遮住 = 白建）。
-          # block 的 add 事件才是分区就绪的时刻，95 排在原生 10-mount 之后。
-          mkdir -p "$ROOT/etc/hotplug.d/block"
-          install -m 0755 system-fixes/95-shared-datadir "$ROOT/etc/hotplug.d/block/95-shared-datadir"
+          # 不再注入 /etc/hotplug.d/block/95-shared-datadir（旧的 F 项）：
+          # 根分区已扩到 4GB，iStore 应用数据保持「最初安装时的默认位置」= 根分区 p2，
+          # 不再把下载/数据目录改写到数据分区。原因见文件头注释。
 
           if [ "${{ inputs.istore_menu }}" = "true" ]; then
             echo "启用：把 iStore 菜单挪到「系统」下面"
@@ -290,19 +307,15 @@ jobs:
           ls -l "$ROOT/etc/uci-defaults/"
           echo "===== 无线自愈钩子 ====="
           ls -l "$ROOT/etc/hotplug.d/ieee80211/"
-          echo "===== block 钩子（应用数据目录自愈）====="
-          ls -l "$ROOT/etc/hotplug.d/block/"
 
           # 兜底：所有首启钩子必须是 LF，否则 #!/bin/sh\r 在设备上直接失效
           for f in "$ROOT"/etc/uci-defaults/* \
-                   "$ROOT"/etc/hotplug.d/ieee80211/05-wifi-path-fix \
-                   "$ROOT"/etc/hotplug.d/block/95-shared-datadir; do
+                   "$ROOT"/etc/hotplug.d/ieee80211/05-wifi-path-fix; do
             sed -i 's/\r$//' "$f"
           done
           echo "----- shebang 字节检查（应为 #!/bin/sh + LF）-----"
           head -c 12 "$ROOT/etc/uci-defaults/05-istore-bootstrap" | od -c
           head -c 12 "$ROOT/etc/hotplug.d/ieee80211/05-wifi-path-fix" | od -c
-          head -c 12 "$ROOT/etc/hotplug.d/block/95-shared-datadir" | od -c
 
           echo "----- 05-istore-bootstrap -----"
           cat "$ROOT/etc/uci-defaults/05-istore-bootstrap"
@@ -320,6 +333,66 @@ jobs:
           rm -f "$OUT"
           tar czf "$OUT" -C "$ROOT" .
           ls -lh "$OUT"
+
+      - name: 预置并打补丁的 openwrt_packit（根分区 1280MB → 4096MB）
+        run: |
+          set -e
+          # F大脚本 openwrt_flippy.sh 的 init_packit_repo() 是：
+          #     cd /opt
+          #     [[ -d "${SELECT_PACKITPATH}" ]] || git clone ... openwrt_packit
+          # 即 **/opt/openwrt_packit 只要已存在，它就完全跳过 clone**。
+          # 所以这里先把上游拉下来、打好分区补丁、再放进 /opt，
+          # 后面 bash flippy-vendor/openwrt_flippy.sh 就会用我们这份。
+          rm -rf /tmp/openwrt_packit
+          git clone -q --single-branch --depth=1 --branch=master \
+            https://github.com/unifreq/openwrt_packit /tmp/openwrt_packit
+          cd /tmp/openwrt_packit
+
+          python3 - <<'PY'
+          import io
+
+          # ① 根分区 1280MB → 4096MB（两个机型的 mk 脚本各一处）
+          #    ROOTFS_MB 一个数控制三件事：
+          #      SIZE              = SKIP_MB + BOOT_MB + ROOTFS_MB   → .img 总大小
+          #      p2 大小            = create_partition 的 "-1" = SIZE − SKIP − BOOT
+          #      /etc/part_size    第 3 列 → 设备首启 first_run.sh 据此补建 p3/p4
+          for f in ("mk_s905d_n1.sh", "mk_s905x3_multi.sh"):
+              s = io.open(f, encoding="utf-8").read()
+              assert s.count("ROOTFS_MB=1280") == 1, "%s: 找不到唯一的 ROOTFS_MB=1280" % f
+              s = s.replace("ROOTFS_MB=1280", "ROOTFS_MB=4096")
+              io.open(f, "w", encoding="utf-8", newline="\n").write(s)
+              print("patched:", f)
+
+          # ② files/first_run.sh（设备首启）：p3(MMC_ROOTFS2 备用槽) 原本等于根分区大小，
+          #    根分区涨到 4G 后 p3 会跟着白占 4G。这里让它固定 1.25G，空间留给 p4 数据区。
+          f = "files/first_run.sh"
+          s = io.open(f, encoding="utf-8").read()
+          a = "ROOTFS_MiB=$(awk '{print $3}' /etc/part_size)"
+          b = "END_P3=$((ROOTFS_MiB * 1024 * 1024 + START_P3 -1))"
+          assert s.count(a) == 1, "first_run.sh: 读取 part_size 的锚点不唯一"
+          assert s.count(b) == 1, "first_run.sh: END_P3 的锚点不唯一"
+          s = s.replace(a, a + "\nROOTFS2_MiB=1280   # p3 备用槽固定 1.25G，不跟随根分区大小")
+          s = s.replace(b, "END_P3=$((ROOTFS2_MiB * 1024 * 1024 + START_P3 -1))")
+          io.open(f, "w", encoding="utf-8", newline="\n").write(s)
+          print("patched:", f)
+          PY
+
+          echo "===== 校验：分区尺寸应为 4 / 384 / 4096 ====="
+          grep -n -E '^(SKIP|BOOT|ROOTFS)_MB=' mk_s905d_n1.sh mk_s905x3_multi.sh
+          echo "===== 校验：p3 已与根分区尺寸解绑 ====="
+          grep -n -E 'ROOTFS2_MiB|END_P3=|AVAIABLE_MiB -lt' files/first_run.sh
+          grep -q '^ROOTFS2_MiB=1280' files/first_run.sh \
+            || { echo "::error::first_run.sh 未打上 ROOTFS2_MiB"; exit 1; }
+          grep -q 'END_P3=$((ROOTFS2_MiB' files/first_run.sh \
+            || { echo "::error::first_run.sh 的 END_P3 未改写"; exit 1; }
+
+          # 放进 /opt，并把属主交还 runner —— 否则后面
+          # init_packit_repo() 里那句 `cp rootfs.tar.gz .` 会因为 /opt 是 root 的而失败。
+          sudo rm -rf /opt/openwrt_packit
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/openwrt_packit
+          cp -a /tmp/openwrt_packit/. /opt/openwrt_packit/
+          ls -ld /opt/openwrt_packit
+          ls /opt/openwrt_packit | head -20
 
       - name: 调用 F大脚本打包固件
         id: package
@@ -345,6 +418,24 @@ jobs:
           cp -v "${PACKAGED_OUTPUTPATH}"/*.img.gz firmware/ 2>/dev/null || true
           [ -z "$(ls -A firmware 2>/dev/null)" ] && { echo "::error::无产出"; exit 1; }
           cd firmware
+
+          # ★ 端到端校验：根分区必须真的是 4096MiB（= 8388608 个 512B 扇区）。
+          #   只校验 CI 里的补丁日志不够——万一上游改了脚本结构、sed/锚点飘了，
+          #   产物会静默退回 1.25G。这里直接解压一个镜像读它的分区表。
+          chk="$(ls *.img.gz | head -n1)"
+          echo "校验镜像: $chk"
+          pigz -dc "$chk" > /tmp/chk.img
+          echo "----- 校验镜像的分区表 -----"
+          fdisk -l /tmp/chk.img || true
+          p2sec="$(fdisk -l /tmp/chk.img | awk '$1 ~ /2$/ {print $5}')"
+          echo "p2 扇区数 = ${p2sec}   （期望 8388608 = 4096MiB）"
+          if [ "$p2sec" != "8388608" ]; then
+            echo "::error::根分区不是 4096MiB（实测 p2=${p2sec} 扇区），分区补丁没生效！"
+            rm -f /tmp/chk.img
+            exit 1
+          fi
+          echo "✅ 根分区 = 4096MiB"
+          rm -f /tmp/chk.img
           # 保留上游原始文件名（含 -flippy-95+o / -flippy-95+ 变体标记）：
           # 「+o」和「+」是两支不同内核变体，改名会把这个信息抹掉，看起来四份一模一样。
           echo "===== 镜像清单（上游原名，含 +o / + 变体标记）====="
@@ -368,14 +459,15 @@ jobs:
               `x.y.y` 表示自动取该系列最新，多个系列用 `_` 分隔）
             - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
             - **产物 = 机型 × 内核系列**：本次为 2 机型 × 2 内核系列 = **4 个镜像**，
-              **四个镜像都已注入下面六项定制**（注入发生在 rootfs 层，所有镜像共用同一份 rootfs）
+              **四个镜像都已注入下面五项定制**（注入发生在 rootfs 层，所有镜像共用同一份 rootfs），
+              并且**四个镜像的根分区都已从 1280MB 扩到 4096MB**（改的是打包参数，见下）
             - **文件名保留上游原始命名**，末尾的 `-flippy-95+o` / `-flippy-95+` 是两支不同的
               内核变体：**`+o` 偏稳、`+` 偏新**（flippy 的两支构建，官方未正式定义，
               社区资料通常说 `+o` 更稳、N1 等盒子更推荐）
                 同一内核系列下：`…k6.12.112-flippy-95+o.img.gz`（带 o）
                               `…k6.18.56-flippy-95+.img.gz`（不带 o）
 
-            ### 已注入的六项定制
+            ### 已注入的五项定制
 
             **① iStore 安装方式（已修正）**
             iStore 不再"解包铺文件"，而是把 6 个官方 ipk 预置到
@@ -446,29 +538,56 @@ jobs:
             （argon_dark 系的 `?v=<%=math.random(1,100000)%>`、design 的 `?v=<%=ver.luciversion%>`）
             会被自动跳过。
 
-            **⑥ 应用数据目录自愈（根分区被灌满的根因）**
-            根分区（`ROOTFS`）只有 **1.25GB**，而镜像本身就自带约 **600MB**
-            （OpenList 136M、dockerd 70M、rclone 68M、containerd 45M、sing-box 42M、
-            gost 35M、node 33M、verysync 32M、xray 30M…），**出厂就只剩几十 MB 空闲**。
-            而开机后从 iStore 装的应用动辄 200MB 级（`kai_session` 195MB、
-            `linkease-full` 149MB），只要它们的**下载/数据目录指向根分区**，一开下载就爆。
-            这些应用的出厂默认值恰恰全是错的：
-            `aria2=/mnt/sda1/aria2`（路径根本不存在）、
-            `transmission=/opt/transmission`（根分区）、
-            `baidudrive 下载路径=/`（根分区）、
-            `filebrowser=/tmp`（内存盘）、`kodexplorer=/opt/kodexplorer`（根分区）、
-            `verysync` 为空、`kai` 数据目录为空。
-            现由 `/etc/hotplug.d/block/95-shared-datadir` 在数据分区挂载后，
-            统一把「下载 / 数据」目录指到数据分区（`MMC_SHARED`，10~12GB）：
-            `…/downloads/{aria2,transmission,qbittorrent,baidu}`、
-            `…/data/{transmission,qbittorrent,verysync,kai,baidudrive,filebrowser,kodexplorer,openlist}`，
-            并把 `/opt/transmission`、`/opt/kodexplorer` 做成指向数据分区的软链
-            （照抄 flippy 已有的 `/opt/docker` 写法）。
-            放 `hotplug.d` 而非 `uci-defaults`：`uci-defaults` 在 `/etc/init.d/boot`（START=10）里跑，
-            而挂载数据分区的 `/etc/init.d/fstab` 是 START=11 —— 那时分区还没挂上，
-            `mkdir` 会把目录建到根分区上（随后被挂载遮住，等于白建）。
-            此外它是**幂等**的：只在当前值为空、或为上面这些已知错误出厂默认值时才改写，
-            你在 LuCI 里自己改过的目录一律不动。
+            ### ★ 根分区扩容：1280MB → 4096MB
+
+            刷完机后 `/`（`ROOTFS`，也就是 p2）是 **4096MB**，不再是 1280MB。
+
+            | 分区 | 卷标 | 旧 | 新 |
+            |---|---|---|---|
+            | p1 | `BOOT` | 384MB | 384MB（不变） |
+            | p2 | **`ROOTFS`** | **1280MB** | **4096MB** |
+            | p3 | `MMC_ROOTFS2` | 1280MB | 1280MB（不变，A/B 备用槽） |
+            | p4 | `MMC_SHARED` | 剩余空间 | 剩余空间（16GB 卡上约 9.1GB） |
+
+            尺寸的来源与改法（都在 CI 里自动完成，刷机方不需要任何手工操作）：
+
+            - 镜像与分区尺寸**全部**来自 F大打包脚本 `unifreq/openwrt_packit` 里的三个数
+              `SKIP_MB=4 / BOOT_MB=384 / ROOTFS_MB=1280`
+              （`mk_s905d_n1.sh`、`mk_s905x3_multi.sh` 各一份）：
+              `SIZE = 4 + 384 + 1280 = 1668MB` 就是 `.img` 的总大小；
+              p2 由 `create_partition` 的 `-1`（占满剩余）得到 = 1280MB；
+              同时把 `SKIP BOOT ROOTFS` 三列写进 rootfs 的 `/etc/part_size`。
+            - 设备**首次开机**时 `/etc/init.d` 里的 `first_run.sh` 会读 `/etc/part_size`，
+              再往盘尾补建 p3（尺寸 = 第 3 列）与 p4（占满剩余）。
+            - 所以只要把 `ROOTFS_MB` 改成 `4096`：`.img` 变 4484MB、p2 变 4096MB，
+              首启之后 p3/p4 会自动跟着调整。
+            - 但 p3（A/B 备用槽）原本与 p2 同尺寸，p2 涨到 4G 后它会白占 4G，
+              于是同时把 `files/first_run.sh` 里 p3 的尺寸固定回 1.25G，空间留给 p4 数据区。
+            - 上游脚本在 CI 里是 `git clone` 下来的，本来改不到。但主脚本
+              `openwrt_flippy.sh` 的 `init_packit_repo()` 写的是
+              `cd /opt` 然后 `[[ -d openwrt_packit ]] || git clone ...` ——
+              **`/opt/openwrt_packit` 只要已存在就完全跳过 clone**。
+              因此 workflow 里先拉上游、打好补丁、再放进 `/opt`，就让它用了我们这份。
+
+            构建末尾还有一道**端到端校验**：解压一份产物镜像、直接读它的分区表，
+            p2 的扇区数必须等于 `8388608`（= 4096MiB），否则整个 job 直接失败 ——
+            避免上游改脚本结构后静默退回到 1.25G。
+
+            ### ⚠️ 已取消注入：应用数据目录自愈（旧 F 项）
+
+            旧固件里有一项 `/etc/hotplug.d/block/95-shared-datadir`，会把
+            `aria2` / `transmission` / `qbittorrent` / `verysync` / `filebrowser` /
+            `kodexplorer` / `vsftpd` 的**下载与数据目录**统一改写到数据分区
+            （`MMC_SHARED`，10~12GB），并把 `/opt/transmission`、`/opt/kodexplorer`
+            做成指向数据分区的软链。
+
+            那是在「根分区只有 1.25GB、镜像自带程序就占掉 ~600MB、出厂只剩几十 MB」的
+            背景下做的兜底。现在根分区已经是 4GB，而 iStore 应用的
+            **最初安装默认位置本来就是根分区 p2**，所以这一项**不再注入** ——
+            应用的数据/下载目录保持出厂默认值，不再被改写。
+
+            脚本本体仍保留在仓库 `system-fixes/95-shared-datadir` 备查；
+            需要重新启用时，把它加回 workflow 的注入列表即可。
 
             ### iStore 菜单位置
             默认保持 iStore 上游原样（`admin/store`，显示在侧边栏顶层）。
