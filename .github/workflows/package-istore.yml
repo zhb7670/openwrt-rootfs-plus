@@ -342,14 +342,14 @@ jobs:
               `x.y.y` 表示自动取该系列最新，多个系列用 `_` 分隔）
             - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
             - **产物 = 机型 × 内核系列**：本次为 2 机型 × 2 内核系列 = **4 个镜像**，
-              **四个镜像都已注入下面三项定制**（注入发生在 rootfs 层，所有镜像共用同一份 rootfs）
+              **四个镜像都已注入下面五项定制**（注入发生在 rootfs 层，所有镜像共用同一份 rootfs）
             - **文件名保留上游原始命名**，末尾的 `-flippy-95+o` / `-flippy-95+` 是两支不同的
               内核变体：**`+o` 偏稳、`+` 偏新**（flippy 的两支构建，官方未正式定义，
               社区资料通常说 `+o` 更稳、N1 等盒子更推荐）
                 同一内核系列下：`…k6.12.112-flippy-95+o.img.gz`（带 o）
                               `…k6.18.56-flippy-95+.img.gz`（不带 o）
 
-            ### 已注入的三项定制
+            ### 已注入的五项定制
 
             **① iStore 安装方式（已修正）**
             iStore 不再"解包铺文件"，而是把 6 个官方 ipk 预置到
@@ -376,6 +376,27 @@ jobs:
             的 `view/ddns-go/ddns-go.htm`，并由 `/etc/uci-defaults/zz-ddnsgo-luci`
             在首次开机把 `ddns-go.config.enabled` 打开、设为开机自启。
             刷完后菜单路径：**服务 → DDNS-GO**。
+
+            **④ 无线路径自愈（换内核后 WiFi 掉线的根因）**
+            内核 6.x 把 Amlogic mmc 控制器的 sysfs 名改过：
+            `6.1.x` 是 `platform/soc/ffe03000.sd/...`，`6.18.x` 是 `platform/soc/ffe03000.mmc/...`。
+            如果 `/etc/config/wireless` 是从旧系统带过来的（恢复配置备份），里面写死的老路径
+            在新内核上**永远匹配不到 phy** → `radioN` 报 `"up": false, "retry_setup_failed": true`；
+            同时 `10-wifi-detect` 会以为"这颗 phy 没人认领"，自动补一条 `LEDE` 开放网络顶上来
+            —— 表现就是"我的 WiFi 不见了，多了个不认识的网络"。
+            现由 `/etc/hotplug.d/ieee80211/05-wifi-path-fix` 在网卡上线时把
+            `ffeXXXXX.sd/` 批量改成 `ffeXXXXX.mmc/`，并在 `radio1` 与 `radio0` 同路径时删掉 `radio1`。
+            放 `hotplug.d` 而非 `uci-defaults`：后者在 `/etc/init.d/boot` 里跑得太早，
+            那时 SDIO 网卡还没枚举完、`/etc/config/wireless` 往往还不存在。
+
+            **⑤ ifit 样式表版本后缀（补丁"看起来没生效"的根因）**
+            uhttpd 只发 `ETag` / `Last-Modified`，**不发 `Cache-Control` / `Expires`**。
+            按 RFC 7234 §4.2.2，浏览器会对这类响应做"启发式缓存"，有效期约
+            `(缓存时刻 − Last-Modified) × 10%`。老 `style.css` 的 `Last-Modified` 是出厂日期，
+            缓存一次能"新鲜"几十天，**期间根本不回服务器验证** —— 于是 ② 的图标补丁明明生效了，
+            浏览器里看到的还是旧界面（按 `Ctrl+Shift+R` 强刷一次才能看到）。
+            现由 `/etc/uci-defaults/98-ifit-css-cachebust` 给 `header.htm` 里的
+            `<link ... style.css>` 加上 `?v=<css 的 mtime>`，URL 一变浏览器必然重拉。
 
             ### iStore 菜单位置
             默认保持 iStore 上游原样（`admin/store`，显示在侧边栏顶层）。
