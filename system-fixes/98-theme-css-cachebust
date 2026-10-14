@@ -1,0 +1,76 @@
+#!/bin/sh
+# ============================================================================
+#  给各主题的样式表链接加版本后缀，解决"补丁在盒子上已经生效、但浏览器还是显示旧的"
+#
+#  【现象】96-istore-theme-align 已经把 iStore 的图标规则追加进各主题的 style.css，
+#          盒子侧证据全绿（文件变大、规则在、HTTP 200 字节数一致），
+#          但用浏览器打开仍是旧样子，必须手动 Ctrl+Shift+R。
+#
+#  【原因】uhttpd 只发 ETag / Last-Modified，**不发 Cache-Control / Expires**。
+#          按 RFC 7234 §4.2.2，浏览器对这类响应做"启发式缓存"，有效期约
+#          (缓存时刻 − Last-Modified) × 10%。出厂 CSS 的 Last-Modified 是打包日期，
+#          缓存一次就可能"新鲜"几十天，期间根本不回服务器验证。
+#
+#  【做法】给 <link ... .css> 的 URL 加一个随 CSS 内容变化的查询串。
+#          URL 一变，浏览器必然重新拉取。
+#
+#  【版本号怎么取】用该主题主 CSS 文件自身的 mtime。
+#          96 是在首启时给主 CSS 追加补丁的，mtime = 补丁落地时间；
+#          只要固件重新打包 / 补丁内容变化，版本号就跟着变。
+#
+#  【哪些主题会被处理】
+#          只处理"主 CSS 里含有 istore-theme-align 标记"的主题
+#          （即 argon 系 / mcat / atmaterial 系 / tomato / ifit）。
+#          另外主动跳过 header.htm 里已经写了动态版本号的主题
+#          （如 argon_dark 系的 ?v=<%=math.random(1,100000)%>、design 的
+#            ?v=<%= ver.luciversion %>），动态版本每次都变，本来就不需要击穿。
+#
+#  【幂等】重复执行时只是把旧版本号换成新版本号，安全。
+# ============================================================================
+
+THEMEDIR=/usr/lib/lua/luci/view/themes
+STATICDIR=/www/luci-static
+MARK='istore-theme-align'
+
+[ -d "$THEMEDIR" ] || exit 0
+
+echo "theme-cachebust: 开始"
+for h in "$THEMEDIR"/*/header.htm; do
+	[ -f "$h" ] || continue
+	t=$(basename "$(dirname "$h")")
+
+	# 动态版本号的主题跳过
+	if grep -q '?v=<%=' "$h" 2>/dev/null; then
+		echo "theme-cachebust:   $t 使用动态版本号（?v=<%=...%>），跳过"
+		continue
+	fi
+
+	# 找出该主题的主 CSS
+	css=""
+	for c in "$STATICDIR/$t/css/style.css" "$STATICDIR/$t/css/$t.css" "$STATICDIR/$t/cascade.css"; do
+		[ -f "$c" ] && { css="$c"; break; }
+	done
+	[ -n "$css" ] || continue
+
+	# 只处理我们打过补丁的主题
+	grep -q "$MARK" "$css" 2>/dev/null || continue
+
+	V=$(date -r "$css" +%Y%m%d%H%M%S 2>/dev/null)
+	[ -n "$V" ] || V=$(date +%Y%m%d%H%M%S)
+
+	cp -a "$h" "$h.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null
+
+	# 给 header.htm 里所有 "<...>.css" 链接加/换版本后缀
+	# 注意：<%=resource%>/<%=node.css%> 这种不以 .css 结尾的（后面是 %>）不会命中
+	sed -i "s#\(href=\"[^\"]*\.css\)\(?v=[^\"]*\)\?\"#\1?v=$V\"#g" "$h"
+
+	echo "theme-cachebust:   $t  ->  ?v=$V"
+done
+
+# 清 LuCI 缓存，避免模板/菜单旧字节码
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+
+logger -t theme-css "各主题样式表已加版本后缀"
+echo "theme-cachebust: 完成"
+exit 0

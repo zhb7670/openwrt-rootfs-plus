@@ -255,14 +255,14 @@ jobs:
 
           mkdir -p "$ROOT/etc/uci-defaults"
           install -m 0755 istore-bootstrap/05-istore-bootstrap "$ROOT/etc/uci-defaults/05-istore-bootstrap"
-          # 96 必须在 95 之后、99 之前：先挪菜单（可选），再补 ifit 的 iStore 图标，最后清缓存
-          install -m 0755 istore-bootstrap/96-istore-menu-icon "$ROOT/etc/uci-defaults/96-istore-menu-icon"
+          # 96 必须在 95 之后、99 之前：先挪菜单（可选），再做跨主题的 iStore 菜单对齐，最后清缓存
+          install -m 0755 istore-bootstrap/96-istore-theme-align "$ROOT/etc/uci-defaults/96-istore-theme-align"
           # zz- 开头：uci-defaults 按字母序执行，zz 排最后，保证压过 ddns-go 包自带的 luci-ddns-go
           install -m 0755 ddnsgo-luci/zz-ddnsgo-luci "$ROOT/etc/uci-defaults/zz-ddnsgo-luci"
           install -m 0755 istore-bootstrap/99-luci-refresh   "$ROOT/etc/uci-defaults/99-luci-refresh"
 
-          # 98 必须在 96 之后（这时 style.css 已经打过补丁，mtime 才是对的）、99 之前
-          install -m 0755 system-fixes/98-ifit-css-cachebust "$ROOT/etc/uci-defaults/98-ifit-css-cachebust"
+          # 98 必须在 96 之后（这时各主题 style.css 已经打过补丁，mtime 才是对的）、99 之前
+          install -m 0755 system-fixes/98-theme-css-cachebust "$ROOT/etc/uci-defaults/98-theme-css-cachebust"
 
           # 无线路径自愈放 hotplug.d 而不放 uci-defaults：
           # uci-defaults 在 /etc/init.d/boot 里跑得太早，那时 SDIO 网卡还没枚举完、
@@ -386,12 +386,31 @@ jobs:
             「点安装插件」不会再秒失败。
             首次开机日志见 `/tmp/istore-bootstrap.log`。
 
-            **② iStore 菜单外观（ifit 主题）**
-            ifit 的侧边栏图标是**按 `data-title` 硬编码**在 `style.css` 里的，而
-            iStore 是全菜单里唯一"没有子菜单的顶层项"，不在那张表里 —— 结果就是
-            无图标、文字贴最左边，与其它菜单不协调。
-            现由 `/etc/uci-defaults/96-istore-menu-icon` 在首次开机自动补上
-            （照抄主题中 Logout 的同款写法，图标取 icomoon `\e903` extension）。
+            **② iStore 菜单外观（全主题对齐）**
+            LuCI 的 `render_topmenu()` 对"**没有子菜单的顶层项**"输出的是裸
+            `<li><a data-title="iStore" href="...">`，而所有主题的侧边栏样式
+            （缩进、盒模型、hover、图标字体）统统挂在
+            `.main > .main-left > .nav > .slide > a(.menu)` 上。整个 admin 菜单里
+            **只有 iStore 是这种裸项**（Logout / Reboot 也是裸项，但主题作者逐个
+            `data-title` 手工补过 CSS，唯独漏了 iStore）—— 所以它文字贴最左边、没有图标。
+            旧版固件只给 ifit 追加过一段 iStore 专用 CSS，于是表现为
+            "**只有 ifit 能对齐，其它主题全歪**"。
+            现由 `/etc/uci-defaults/96-istore-theme-align` 在首次开机做**主题无关**的修复：
+            改 `header.htm` 的菜单渲染层，把裸项输出成
+            `<li class="slide"><a class="menu exit" data-title="iStore" ...>`，
+            与普通顶层项同构 → 缩进 / 盒模型 / hover / 图标字体全部自动继承主题原生样式；
+            再给各主题的 `script.js` 追加一段**捕获阶段**的点击兜底（叶子项没有子菜单可展开，
+            要抢在主题的 `return false` 之前放行）；并顺手修掉 tomato 主题把
+            `.slide > a` 的 `href` 一并 `removeAttr` 的问题。图标按主题族的图标字体补一个
+            字形码：argon 系取 `ssr` 的 `\e906`(dashboard 宫格)，mcat / atmaterial / tomato
+            取 `advancedtomato` 的 `\e018`(加号＝安装/添加)；material 主题侧边栏本来就没有
+            任何图标、design 自带 `.menu2` 实现、rosy 把叶子项移出 `.nav`，
+            这三者保持原样；ifit 沿用旧版的青色图标（`\e903` + `#26C6DA`），
+            缩进改为跟随主题（旧版硬写的 `padding-left:36px` 现在反而会比同主题
+            其它项多 1px，已去掉）。
+            效果不是"把所有主题强行统一成一个缩进值"，而是"**每个主题内部自洽**"
+            —— 各主题继承到的缩进并不相同（argon 40px、argon_dark 56px、ifit 35px、
+            material 16px、design 50px…），但都与同主题其它项一致。
 
             **③ DDNS-GO 的 LuCI 菜单**
             rootfs 里 `ddns-go(6.15.0-1)` 与 `luci-app-ddns-go(1.6.5)` 其实都装好了，
@@ -415,14 +434,17 @@ jobs:
             放 `hotplug.d` 而非 `uci-defaults`：后者在 `/etc/init.d/boot` 里跑得太早，
             那时 SDIO 网卡还没枚举完、`/etc/config/wireless` 往往还不存在。
 
-            **⑤ ifit 样式表版本后缀（补丁"看起来没生效"的根因）**
+            **⑤ 样式表版本后缀（补丁"看起来没生效"的根因）**
             uhttpd 只发 `ETag` / `Last-Modified`，**不发 `Cache-Control` / `Expires`**。
             按 RFC 7234 §4.2.2，浏览器会对这类响应做"启发式缓存"，有效期约
             `(缓存时刻 − Last-Modified) × 10%`。老 `style.css` 的 `Last-Modified` 是出厂日期，
-            缓存一次能"新鲜"几十天，**期间根本不回服务器验证** —— 于是 ② 的图标补丁明明生效了，
+            缓存一次能"新鲜"几十天，**期间根本不回服务器验证** —— 于是 ② 的菜单对齐补丁明明生效了，
             浏览器里看到的还是旧界面（按 `Ctrl+Shift+R` 强刷一次才能看到）。
-            现由 `/etc/uci-defaults/98-ifit-css-cachebust` 给 `header.htm` 里的
-            `<link ... style.css>` 加上 `?v=<css 的 mtime>`，URL 一变浏览器必然重拉。
+            现由 `/etc/uci-defaults/98-theme-css-cachebust` 给**所有被打过补丁的主题**的
+            `header.htm` 里 `<link ... .css>` 加上 `?v=<该主题 style.css 的 mtime>`，
+            URL 一变浏览器必然重拉。本来就用动态版本号的主题
+            （argon_dark 系的 `?v=<%=math.random(1,100000)%>`、design 的 `?v=<%=ver.luciversion%>`）
+            会被自动跳过。
 
             **⑥ 应用数据目录自愈（根分区被灌满的根因）**
             根分区（`ROOTFS`）只有 **1.25GB**，而镜像本身就自带约 **600MB**

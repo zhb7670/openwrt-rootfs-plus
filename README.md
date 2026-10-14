@@ -60,7 +60,7 @@ flippy-vendor/
 | # | 定制项 | 做法 | 相关文件 |
 |---|---|---|---|
 | ① | **iStore 应用商店** | 加源 + 把 6 个官方 ipk 预置到 `/usr/share/istore-bootstrap/`，**首次开机由系统自带 opkg 真正安装** | `05-istore-bootstrap` |
-| ② | **iStore 菜单图标** | ifit 主题的侧边栏图标是按 `data-title` 硬编码在 `style.css` 里的，iStore 是全菜单唯一"无子菜单的顶层项"，不在表里 → 追加一段补丁（图标取 icomoon `\e903`） | `96-istore-menu-icon` |
+| ② | **iStore 菜单全主题对齐** | iStore 是全菜单唯一"没有子菜单的顶层项"，LuCI 对它输出裸 `<li><a data-title=...>`，拿不到 `.nav > .slide > a` 的样式 → 改 `header.htm` 让它与普通顶层项同构（`li.slide > a.menu.exit`），再补点击兜底与按主题族的图标 | `96-istore-theme-align` |
 | ③ | **DDNS-GO 的 LuCI 菜单** | rootfs 里 `ddns-go` + `luci-app-ddns-go` 其实都装好了，但官方用 `menu.d/*.json + resources/view/*.js` 新架构，本固件的老式 LuCI 认不了 → 补一个老式 controller + 内嵌 WebUI(:9876) 的 view，并打开 `enabled` | `ddnsgo-luci/` |
 
 > ⚠️ **①为什么必须"预置 ipk + 首启用 opkg 装"，而不是直接解包铺文件？**
@@ -86,7 +86,7 @@ flippy-vendor/
 | 镜像压缩 | workflow 参数 `gzip_imgs` |
 | iStore 菜单位置（顶层 / 挪到"系统"下） | workflow 参数 `istore_menu` |
 | iStore 首启安装钩子 | `istore-bootstrap/05-istore-bootstrap` |
-| ifit 主题的 iStore 图标/颜色 | `istore-bootstrap/96-istore-menu-icon`（`content:"\e903"` / `color:#26C6DA`） |
+| iStore 侧边栏对齐与图标（全主题） | `istore-bootstrap/96-istore-theme-align`（argon 系 `ssr:\e906`、mcat/atmaterial/tomato `advancedtomato:\e018`、ifit 沿用 `HomeLedeIcomoon:\e903` + `#26C6DA`） |
 | DDNS-GO 的菜单入口与页面 | `ddnsgo-luci/rootfs/usr/lib/lua/luci/...` |
 | DDNS-GO 的启用钩子 | `ddnsgo-luci/zz-ddnsgo-luci` |
 | 应用数据/下载目录的落点（默认数据分区） | `system-fixes/95-shared-datadir` |
@@ -113,11 +113,39 @@ flippy-vendor/
 | # | 项目 | 注入位置 | 说明 |
 |---|---|---|---|
 | A | iStore 应用商店 | `/usr/share/istore-bootstrap/` + `/etc/uci-defaults/05-istore-bootstrap` | 6 个 ipk 离线预置，首启用目标系统自带的 opkg 真正安装（**不能直接铺文件**，否则包不登记、软链丢失） |
-| B | iStore 侧边栏图标 | `/etc/uci-defaults/96-istore-menu-icon` | ifit 主题只给"有子菜单"的顶层项硬编码了图标；iStore 是唯一的裸 `<li>`，所以补 3 条 CSS |
+| B | **iStore 侧边栏对齐与图标（全主题）** | `/etc/uci-defaults/96-istore-theme-align` | 裸顶层项 → 与普通顶层项同构；再补点击兜底 + 按主题族补图标。见下 |
 | C | DDNS-GO 的 LuCI 入口 | `ddnsgo-luci/` + `/etc/uci-defaults/zz-ddnsgo-luci` | 官方包用 `menu.d` 新架构，本固件的 `createindex()` 只扫 `controller/*.lua`，菜单天生不出现 |
 | D | **无线路径自愈** | `/etc/hotplug.d/ieee80211/05-wifi-path-fix` | 见下 |
-| E | **ifit 样式表版本后缀** | `/etc/uci-defaults/98-ifit-css-cachebust` | 见下 |
+| E | **样式表版本后缀（全主题）** | `/etc/uci-defaults/98-theme-css-cachebust` | 见下 |
 | F | **应用数据目录自愈** | `/etc/hotplug.d/block/95-shared-datadir` | 见下 |
+
+### B. iStore 侧边栏对齐（全主题）
+
+LuCI 的 `render_topmenu()` 对**没有子菜单的顶层项**输出的是裸 `<li>`：
+
+```html
+<li><a data-title="iStore" href="/cgi-bin/luci/admin/store">iStore</a></li>
+```
+
+而所有主题的侧边栏样式（`padding-left` 缩进、盒模型、hover、图标字体的 `font-family`）
+统统挂在 `.main > .main-left > .nav > .slide > a(.menu)` 上。
+整个 admin 菜单里**只有 iStore 是这种裸项**（Logout / Reboot 也是裸项，但主题作者
+逐个 `data-title` 手工补过 CSS，唯独漏了 iStore），所以它文字贴最左边、而且没有图标。
+旧版固件只给 ifit 追加过一段 iStore 专用 CSS —— 于是表现为「**只有 ifit 能对齐，其它主题全歪**」。
+
+修复分四步，**全部与具体主题无关**：
+
+| 步骤 | 做法 |
+|---|---|
+| ① 结构 | 改 `header.htm` 的渲染层：`<li><a data-title=...>` → `<li class="slide"><a class="menu exit" data-title=...>`，与普通顶层项同构 → 缩进 / 盒模型 / hover / 图标字体全部自动继承 |
+| ② 行为 | 各主题对 `.slide > .menu` 的 `click` 一律 `return false`（手风琴），叶子项没有子菜单可展开 → 在**捕获阶段**抢先放行、直接跳转。用 `.exit` 作标记，因为 design 主题本身就有 `if(!menu.hasClass("exit"))` |
+| ③ tomato 特例 | `tomato/js/script.js` 里有 `$( ".slide > a" ).removeAttr("href")`，会把叶子项的 `href` 一并删掉 → 排除 `.exit` |
+| ④ 图标 | 结构改好后 iStore 已继承主题图标字体的 `font-family`，只差一个字形码：argon 系取 `ssr` 的 `\e906`(dashboard 宫格)，mcat / atmaterial / tomato 取 `advancedtomato` 的 `\e018`(加号)；`material` 侧边栏本来就没有任何图标、`design` 自带 `.menu2`、`rosy` 把叶子项移出 `.nav` → 这三者保持原样；ifit 沿用旧版的青色图标（`HomeLedeIcomoon` 的 `\e903` + `#26C6DA`），缩进改为跟随主题 |
+
+> 效果不是"把所有主题强行统一成一个缩进值"，而是"**每个主题内部自洽**"：
+> 各主题继承到的缩进并不相同（argon 40px、argon_dark 56px、ifit 35px、material 16px、
+> design 50px…），但都与同主题其它项**一致**——这正是用户要的"对齐"。
+> 另外 `bootstrap` / `bootstrap_mod` 是宽屏水平菜单，iStore 的位置本来就正确。
 
 ### D. 无线路径自愈（内核 6.x 的坑）
 
@@ -139,14 +167,16 @@ flippy-vendor/
 > 那时 SDIO 网卡还没枚举完、`/etc/config/wireless` 往往还不存在。`05-` 前缀保证它排在
 > `10-wifi-detect` 之前，先修好路径再让 detect 判重，就不会多补一个 radio。
 
-### E. 样式表版本后缀
+### E. 样式表版本后缀（全主题）
 
 uhttpd 只发 `ETag` / `Last-Modified`，**不发 `Cache-Control` / `Expires`**。按 RFC 7234 §4.2.2，
 浏览器会对这类响应做"启发式缓存"，有效期约 `(缓存时刻 − Last-Modified) × 10%`。
 老 `style.css` 的 `Last-Modified` 是出厂日期，缓存一次能"新鲜"几十天，**期间根本不回服务器验证** ——
 于是补丁明明生效了，用户看到的还是旧界面。
 
-钩子给 `header.htm` 里的 `<link ... style.css>` 加上 `?v=<css 的 mtime>`，URL 一变浏览器必然重拉。
+钩子给**所有被打过补丁的主题**的 `header.htm` 里的 `<link ... .css>` 加上
+`?v=<该主题 style.css 的 mtime>`，URL 一变浏览器必然重拉。本来就用动态版本号的主题
+（argon_dark 系的 `?v=<%=math.random(1,100000)%>`、design 的 `?v=<%=ver.luciversion%>`）自动跳过。
 
 ### F. 应用数据目录自愈（根分区被灌满的坑）
 

@@ -1,0 +1,245 @@
+#!/bin/sh
+# ============================================================================
+#  让"叶子顶层菜单项"（iStore）在【任意】LuCI 主题下都能对齐  —— 跨主题版
+#
+#  【问题】
+#    LuCI 的 render_topmenu() 对"没有子菜单的顶层项"输出的是裸 <li>：
+#        <li><a data-title="iStore" href="...">iStore</a></li>
+#    而所有主题的侧边栏样式（缩进 padding-left、盒模型、hover、图标字体）
+#    统统挂在   .main > .main-left > .nav > .slide > a(.menu)   上。
+#    整个 admin 菜单里只有 iStore 是这种"裸项"（Logout / Reboot 也是裸项，
+#    但主题作者逐个 data-title 手工补过 CSS，唯独漏了 iStore），
+#    所以只有它文字贴最左边、而且没有图标。
+#    旧版固件只给 ifit 的 style.css 追加过一段 iStore 专用 CSS，
+#    于是出现"只有 ifit 能对齐，其它主题全歪"。
+#
+#  【修法】不再逐主题打样式补丁，而是从菜单渲染层改结构 + 少量按主题族的图标补充
+#
+#    1) header.htm（结构层 · 主题无关）
+#         裸 <li><a data-title=...>  →  <li class="slide"><a class="menu exit" data-title=...>
+#       与普通顶层项同构 → 缩进 / 盒模型 / hover / 图标字体 全部自动继承主题原生样式。
+#       实测各主题继承到的缩进并不相同（argon 40px、argon_dark 56px、ifit 35px、
+#       material 16px、design 50px…），但都与同主题其它项**一致** —— 这正是目标：
+#       不是"把所有主题强行统一成一个数字"，而是"每个主题内部自洽"。
+#       只改"顶层"那一处：顶层项紧跟着的行是 nodeurl(category,…)，
+#       子菜单项是 nodeurl(prefix,…)，靠这个区分。
+#
+#    2) script.js（行为层 · 主题无关）
+#       各主题对 .slide > .menu 的 click 一律 return false（手风琴行为）。
+#       叶子项没有子菜单可展开，所以在【捕获阶段】抢先放行、直接跳转。
+#       用 .exit 作标记：design 主题本身就写着 if(!menu.hasClass("exit"))，
+#       说明"叶子项打 .exit"是这套主题圈的通行约定。
+#
+#    3) tomato 特例
+#       /www/luci-static/tomato/js/script.js 里有 $( ".slide > a" ).removeAttr("href")，
+#       会把叶子项刚拿到的 href 也删掉（点不动）→ 排除 .exit。
+#
+#    4) 图标（按主题族的图标字体补一个字形码）
+#       结构改好后 iStore 已经是 .slide > .menu > a，主题的通用规则已经替它把
+#       图标字体的 font-family 施加上了：
+#           argon 系               → ssr             （.slide > .menu:before）
+#           mcat / atmaterial / tomato → advancedtomato （.slide > a:before）
+#           ifit                   → HomeLedeIcomoon（.slide > a:before）
+#       唯独缺一个 content，补一条规则即可：
+#           argon 系 (ssr)            \e906 = dashboard（2x2 宫格，最贴"应用矩阵"）
+#           mcat/atmaterial*/tomato   \e018 = 加号（意为"安装/添加应用"，全族未被占用）
+#       material 主题侧边栏本来就没有任何图标 → 不补（补了反而不一致）
+#       design   主题自带 .menu2 实现、iStore 本来就有图标 → 不补
+#       rosy     主题把叶子项移出 .nav、与 Logout 同款 → 设计如此，不动
+#       bootstrap / bootstrap_mod 是宽屏水平菜单、无图标 → 不动
+#       ifit     沿用旧版的青色图标（\e903 / #26C6DA），缩进改为跟随主题
+#                （旧版硬写的 padding-left:36px 现在反而会多出 1px，已去掉）
+#
+#  【幂等】可重复执行，已处理过的会跳过。
+#  【备份】被改动到的原文件会复制到 /root/istore-align-bak.<时间戳>/
+#  【回滚】用备份逐个覆盖回去：
+#              B=/root/istore-align-bak.<时间戳>
+#              ( cd "$B" && for f in $(find . -type f); do cp -a "$f" "/$f"; done )
+#          或按 grep 找出来手工删掉追加段：
+#              grep -rl 'istore-theme-align' /www/luci-static
+# ============================================================================
+
+THEMEDIR=/usr/lib/lua/luci/view/themes
+STATICDIR=/www/luci-static
+PAT='<li><a data-title="%s" href="%s">%s</a></li>'
+MARK='istore-theme-align'
+ICONMARK='istore-theme-align-icon'
+BAK="/root/istore-align-bak.$(date +%Y%m%d_%H%M%S)"
+
+[ -d "$THEMEDIR" ] || { echo "istore-align: 没有 $THEMEDIR，跳过"; exit 0; }
+THEMES=$(ls "$THEMEDIR" 2>/dev/null)
+[ -n "$THEMES" ] || { echo "istore-align: 没有可用主题，跳过"; exit 0; }
+
+# 备份：把绝对路径原样映射到 $BAK 下面（幂等——同一文件只备一次）
+BAKN=0
+baksave() {
+	[ -f "$1" ] || return 0
+	[ -f "$BAK$1" ] && return 0
+	mkdir -p "$BAK$(dirname "$1")" 2>/dev/null
+	cp -a "$1" "$BAK$1" 2>/dev/null
+	BAKN=$((BAKN+1))
+	return 0
+}
+
+echo "istore-align: 开始"
+
+# ---------------------------------------------------------------- 1) header.htm
+echo "istore-align: 1) header.htm 结构改写"
+for t in $THEMES; do
+	h="$THEMEDIR/$t/header.htm"
+	[ -f "$h" ] || continue
+	grep -q 'menu exit' "$h" 2>/dev/null && continue
+	lines=$(grep -Fn "$PAT" "$h" 2>/dev/null | cut -d: -f1)
+	[ -n "$lines" ] || continue
+	# 先挑出"确实是顶层项"的行号（紧随其后几行出现 nodeurl(category,；
+	# 子菜单项是 nodeurl(prefix,），确认有命中再备份、再改，避免无谓产生备份
+	targets=""
+	for L in $lines; do
+		if sed -n "$((L+1)),$((L+3))p" "$h" 2>/dev/null | grep -q 'nodeurl(category,'; then
+			targets="$targets $L"
+		fi
+	done
+	[ -n "$targets" ] || continue
+	baksave "$h"
+	n=0
+	for L in $targets; do
+		sed -i "${L}s#<li><a data-title#<li class=\"slide\"><a class=\"menu exit\" data-title#" "$h"
+		n=$((n+1))
+	done
+	[ "$n" -gt 0 ] && echo "istore-align:   $t 改写 $n 处"
+done
+
+# ---------------------------------------------------------------- 2) script.js
+echo "istore-align: 2) script.js 点击兜底"
+for t in $THEMES; do
+	for js in "$STATICDIR/$t/js/script.js" "$STATICDIR/$t/js/design.js"; do
+		[ -f "$js" ] || continue
+		grep -q "$MARK" "$js" 2>/dev/null && continue
+		baksave "$js"
+		cat >> "$js" <<'JSEOF'
+
+/* ===== istore-theme-align：叶子顶层项（iStore 等）点击兜底 ===== */
+/* 主题对 .main > .main-left > .nav > .slide > .menu 的 click 会 return false，
+   从而吃掉 <a> 的默认跳转。带 .exit 标记的叶子项没有子菜单可展开，
+   所以在【捕获阶段】抢先放行 —— 早于主题绑在元素上的冒泡处理器。 */
+(function () {
+    if (window.__istoreAlignHooked) return;
+    window.__istoreAlignHooked = true;
+    document.addEventListener('click', function (e) {
+        var t = e.target;
+        if (!t || !t.closest) return;
+        var a = t.closest('.main > .main-left > .nav > .slide > .menu.exit');
+        if (!a) return;
+        var href = a.getAttribute('href');
+        if (!href || href === '#') return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        window.location.href = href;
+    }, true);
+})();
+JSEOF
+		echo "istore-align:   $t 追加点击兜底 -> $(basename "$js")"
+	done
+done
+
+# ---------------------------------------------------------------- 3) tomato 特例
+echo "istore-align: 3) tomato 的 removeAttr(\"href\") 排除 .exit"
+for t in $THEMES; do
+	js="$STATICDIR/$t/js/script.js"
+	[ -f "$js" ] || continue
+	grep -q 'removeAttr(.href.)' "$js" 2>/dev/null || continue
+	# 已经排除过 .exit 就跳过（grep -F 精确匹配，避免 BRE 里 \. 被当成字面点而误判）
+	if grep -qF 'not(".exit")' "$js" 2>/dev/null || grep -qF "not('.exit')" "$js" 2>/dev/null; then
+		continue
+	fi
+	baksave "$js"
+	sed -i 's#\$("\.slide > a")\.removeAttr("href")#$( ".slide > a" ).not(".exit").removeAttr("href")#g' "$js"
+	sed -i "s#\\\$('.slide > a').removeAttr('href')#\$('.slide > a').not('.exit').removeAttr('href')#g" "$js"
+	if grep -qF 'not(".exit")' "$js" 2>/dev/null || grep -qF "not('.exit')" "$js" 2>/dev/null; then
+		echo "istore-align:   $t 已排除 .exit"
+	else
+		echo "istore-align:   !! $t 未能改写，请手工检查 $js"
+	fi
+done
+
+# ---------------------------------------------------------------- 4) 图标
+add_icon() {
+	t="$1"; cp="$2"; fam="$3"
+	css=""
+	for c in "$STATICDIR/$t/css/style.css" "$STATICDIR/$t/css/$t.css" "$STATICDIR/$t/cascade.css"; do
+		[ -f "$c" ] && { css="$c"; break; }
+	done
+	[ -n "$css" ] || return 0
+	grep -q "$ICONMARK" "$css" 2>/dev/null && return 0
+	baksave "$css"
+	{
+		printf '\n/* ===== %s：iStore 侧边栏图标 ===== */\n' "$ICONMARK"
+		printf '.main > .main-left > .nav > .slide > a.menu.exit[data-title="iStore"]:before {\n'
+		[ -n "$fam" ] && printf '    font-family: "%s" !important;\n' "$fam"
+		printf '    content: "\\%s" !important;\n}\n' "$cp"
+	} >> "$css"
+	echo "istore-align:   $t 补图标 \\$cp -> ${css#$STATICDIR/}"
+}
+
+# ifit 保留旧版补丁（青色 + 36px），保证零视觉回退
+	add_ifit_legacy() {
+	t=ifit
+	css="$STATICDIR/$t/css/style.css"
+	[ -f "$css" ] || return 0
+	if grep -q "$ICONMARK" "$css" 2>/dev/null; then
+		return 0
+	fi
+	baksave "$css"
+	cat >> "$css" <<'IFIT_CSS_EOF'
+
+/* ===== istore-theme-align-icon：iStore 菜单图标（ifit，沿用旧版外观） ===== */
+/* 注：不再硬写 padding-left / line-height。旧版之所以要写，是因为当时 iStore
+   还是"裸 <li>"、拿不到主题缩进；现在结构已经与普通顶层项同构、缩进自动继承，
+   再硬写反而会比同主题其它项多 1px（实测 36px vs 35px）。只保留图标本体。 */
+.main > .main-left > .nav > .slide > a.menu.exit[data-title="iStore"]:before {
+    content: "\e903";
+    color: #26C6DA !important;
+    display: inline-block;
+    top: -1px;
+    left: -10px;
+    position: relative;
+    vertical-align: middle;
+    font-family: "HomeLedeIcomoon" !important;
+    font-style: normal !important;
+    font-weight: normal !important;
+    font-variant: normal !important;
+    text-transform: none !important;
+    speak: none;
+    line-height: 1;
+    -webkit-font-smoothing: antialiased;
+    border-radius: 50%;
+    background-color: transparent;
+}
+
+.main > .main-left > .nav > .slide > a.menu.exit[data-title="iStore"]:hover {
+    color: #ff8534;
+}
+/* ===== istore-theme-align-icon 结束 ===== */
+IFIT_CSS_EOF
+	echo "istore-align:   ifit 补图标 \\e903 -> ifit/css/style.css"
+}
+
+echo "istore-align: 4) 侧边栏图标"
+for t in $THEMES; do
+	case "$t" in
+		argon|argon_dark|argon_dark_purple|argon_light|argon_light_green)
+			add_icon "$t" e906 ssr ;;
+		mcat|atmaterial|atmaterial_Brown|atmaterial_red|tomato)
+			add_icon "$t" e018 advancedtomato ;;
+		ifit)
+			add_ifit_legacy ;;
+		*) : ;;
+	esac
+done
+
+if [ "$BAKN" -gt 0 ]; then
+	echo "istore-align: 完成（改动前已备份 $BAKN 个文件到 $BAK）"
+else
+	echo "istore-align: 完成（无改动，无需备份）"
+fi
+exit 0
