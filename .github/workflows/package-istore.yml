@@ -420,17 +420,30 @@ jobs:
           cd firmware
 
           # ★ 端到端校验：根分区必须真的是 4096MiB（= 8388608 个 512B 扇区）。
-          #   只校验 CI 里的补丁日志不够——万一上游改了脚本结构、sed/锚点飘了，
+          #   只校验 CI 里的补丁日志不够——万一上游改了脚本结构、锚点飘了，
           #   产物会静默退回 1.25G。这里直接解压一个镜像读它的分区表。
+          #
+          #   ⚠️ 不要用 `fdisk -l` 的表格来解析！对**镜像文件**（不是块设备）来说
+          #      "Boot" 列是空的，awk 按空白切列时整行会左移一位，
+          #      $5 拿到的是 Size（"4G"）而不是 Sectors（8388608）——第一次跑就
+          #      因为这个误报过一次，白丢一次构建。改用列名明确的两种方式交叉验证。
           chk="$(ls *.img.gz | head -n1)"
           echo "校验镜像: $chk"
           pigz -dc "$chk" > /tmp/chk.img
-          echo "----- 校验镜像的分区表 -----"
+          echo "镜像总大小: $(stat -c %s /tmp/chk.img) 字节（期望 4701814784 = 4484MiB）"
+          echo "----- fdisk -l（给人看）-----"
           fdisk -l /tmp/chk.img || true
-          p2sec="$(fdisk -l /tmp/chk.img | awk '$1 ~ /2$/ {print $5}')"
-          echo "p2 扇区数 = ${p2sec}   （期望 8388608 = 4096MiB）"
-          if [ "$p2sec" != "8388608" ]; then
-            echo "::error::根分区不是 4096MiB（实测 p2=${p2sec} 扇区），分区补丁没生效！"
+          echo "----- fdisk -o Device,Sectors（方法A）-----"
+          fdisk -l -o Device,Sectors /tmp/chk.img 2>/dev/null || true
+          echo "----- sfdisk -d（方法B）-----"
+          sfdisk -d /tmp/chk.img 2>/dev/null || true
+
+          p2_a="$(fdisk -l -o Device,Sectors /tmp/chk.img 2>/dev/null | awk '$1 ~ /2$/ {print $2}')"
+          p2_b="$(sfdisk -d /tmp/chk.img 2>/dev/null | awk -F'[:,= ]+' '$1 ~ /img2$/ {for(i=1;i<=NF;i++) if($i=="size") print $(i+1)}')"
+          echo "p2 扇区数: 方法A=${p2_a:-空}  方法B=${p2_b:-空}  （期望 8388608 = 4096MiB）"
+
+          if [ "$p2_a" != "8388608" ] && [ "$p2_b" != "8388608" ]; then
+            echo "::error::根分区不是 4096MiB（A=${p2_a:-空} / B=${p2_b:-空} 扇区），分区补丁没生效！"
             rm -f /tmp/chk.img
             exit 1
           fi
