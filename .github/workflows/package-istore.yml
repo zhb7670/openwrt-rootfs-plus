@@ -48,9 +48,9 @@ on:
   workflow_dispatch:
     inputs:
       kernel_version:
-        description: "内核系列（6.1.y=自动取该系列最新）"
+        description: "内核系列：单个写 6.18.y；要多个用下划线分隔，如 6.12.y_6.18.y（每个系列都自动取最新）"
         required: false
-        default: "6.1.y"
+        default: "6.12.y_6.18.y"
       openwrt_ver:
         description: "固件版本号"
         required: false
@@ -305,9 +305,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           body: |
             ### 本次打包
-            - 基于 F大官方 rootfs（ophub）
-            - 内核：`${{ inputs.kernel_version }}`（ophub/kernel）
+            - 基于 F大官方 rootfs（ophub/flippy-openwrt-actions 月度存档）
+            - 内核：`${{ inputs.kernel_version }}`（ophub/kernel；
+              `x.y.y` 表示自动取该系列最新，多个系列用 `_` 分隔）
             - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
+            - **产物 = 机型 × 内核系列**：本次为 2 机型 × 2 内核系列 = **4 个镜像**，
+              **四个镜像都已注入下面三项定制**（注入发生在 rootfs 层，所有镜像共用同一份 rootfs）
 
             ### 已注入的三项定制
 
