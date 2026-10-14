@@ -25,21 +25,51 @@ flippy-vendor/
 
 ## 使用方法
 
+仓库里有两个打包 workflow，按需要选一个：
+
+| Workflow | 产出 Release tag | 内容 |
+|---|---|---|
+| `Package N1 & X96Max+ (self-contained)` | `N1-X96MaxPlus` | **纯净版**：F大官方 rootfs + 内核，不注入任何东西 |
+| `Package N1 & X96Max+ (with iStore + DDNS-GO)` | `N1-X96MaxPlus-iStore` | **定制版**：在纯净版基础上注入 iStore + 菜单图标修复 + DDNS-GO 的 LuCI 入口 |
+
 ### 方式一：在线打包（默认）
 
-1. 打开仓库的 **Actions** → `Package N1 & X96Max+ (self-contained)`
+1. 打开仓库的 **Actions**，选中你要的 workflow
 2. 点 **Run workflow**，参数保持默认即可
 3. 等待约 5~10 分钟
-4. 到 **Releases** → tag `N1-X96MaxPlus` 下载固件
+4. 到 **Releases** 下载对应 tag 的固件
 
 ### 方式二：完全离线打包（长期可用）
 
-先把你自己的 rootfs 上传到本仓库的 Releases，tag 设为 `ROOTFS`，然后：
+先把你自己的 rootfs 上传到本仓库的 Releases，tag 设为 `ROOTFS`，然后触发
+`self-contained` workflow，在 `rootfs_file` 填那个资产文件名
+（如 `openwrt-armsr-armv8-generic-rootfs.tar.gz`）：
 
-1. 触发 workflow，在 `rootfs_file` 填那个资产文件名（如 `openwrt-armsr-armv8-generic-rootfs.tar.gz`）
-2. 此时**不再访问 ophub**，只依赖你上传的 rootfs + 自己的脚本
+1. 此时**不再访问 ophub**，只依赖你上传的 rootfs + 自己的脚本
 
 > 这样即使 F大（ophub/unifreq）全部下架，本仓库仍可正常打包。
+
+---
+
+## 定制版固件里注入了什么
+
+`Package N1 & X96Max+ (with iStore + DDNS-GO)` 会在 rootfs 里注入三项定制，
+**刷完即用，不需要任何手工操作**：
+
+| # | 定制项 | 做法 | 相关文件 |
+|---|---|---|---|
+| ① | **iStore 应用商店** | 加源 + 把 6 个官方 ipk 预置到 `/usr/share/istore-bootstrap/`，**首次开机由系统自带 opkg 真正安装** | `05-istore-bootstrap` |
+| ② | **iStore 菜单图标** | ifit 主题的侧边栏图标是按 `data-title` 硬编码在 `style.css` 里的，iStore 是全菜单唯一"无子菜单的顶层项"，不在表里 → 追加一段补丁（图标取 icomoon `\e903`） | `96-istore-menu-icon` |
+| ③ | **DDNS-GO 的 LuCI 菜单** | rootfs 里 `ddns-go` + `luci-app-ddns-go` 其实都装好了，但官方用 `menu.d/*.json + resources/view/*.js` 新架构，本固件的老式 LuCI 认不了 → 补一个老式 controller + 内嵌 WebUI(:9876) 的 view，并打开 `enabled` | `ddnsgo-luci/` |
+
+> ⚠️ **①为什么必须"预置 ipk + 首启用 opkg 装"，而不是直接解包铺文件？**
+> 解包铺文件会**绕过 opkg**，导致：包不进 opkg 数据库（iStore 自升级检测失败）、
+> `Alternatives` 不处理（`coreutils-stty` 的 `/bin/stty` 是 opkg 现建的软链，铺不出来）、
+> 依赖缺失（`taskd` 缺 `script-utils` → 执行 `exec script` 报 not found → 点安装 exit 127 秒失败）。
+
+> ⚠️ **行尾必须是 LF**：`istore-bootstrap/`、`ddnsgo-luci/` 下的脚本都没有扩展名，
+> 一旦被写成 CRLF，`#!/bin/sh\r` 在路由器上会直接报 not found，首启钩子整段失效。
+> 已在 `.gitattributes` 里强制 `eol=lf`，workflow 里还加了 `sed -i 's/\r$//'` 兜底。
 
 ---
 
@@ -53,6 +83,11 @@ flippy-vendor/
 | 支持的机型 | workflow 参数 `PACKAGE_SOC` |
 | 内核版本 | workflow 参数 `kernel_version` |
 | 镜像压缩 | workflow 参数 `gzip_imgs` |
+| iStore 菜单位置（顶层 / 挪到"系统"下） | workflow 参数 `istore_menu` |
+| iStore 首启安装钩子 | `istore-bootstrap/05-istore-bootstrap` |
+| ifit 主题的 iStore 图标/颜色 | `istore-bootstrap/96-istore-menu-icon`（`content:"\e903"` / `color:#26C6DA`） |
+| DDNS-GO 的菜单入口与页面 | `ddnsgo-luci/rootfs/usr/lib/lua/luci/...` |
+| DDNS-GO 的启用钩子 | `ddnsgo-luci/zz-ddnsgo-luci` |
 
 改完直接重新触发 workflow 即可生效。
 

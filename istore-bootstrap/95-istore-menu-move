@@ -1,0 +1,47 @@
+#!/bin/sh
+# ===========================================================================
+#  可选：把 iStore 菜单从侧边栏顶层挪到"系统"下面，与 autoreboot/diskman 等一致
+#
+#  ⚠️ 默认不启用。启用方式见 package-istore.yml 的 istore_menu 输入项。
+#
+#  原理（已在真机验证，apply → revert 往返逐字节一致）：
+#    admin/store 节点必须"真实存在且 hidden"，否则 dispatcher.lua:358 会报
+#      "The page at 'admin/store/pages/' has no parent node so the access to
+#       this location has been denied."
+#    原因：createtree() 遍历时，_create_node() 自动补出来的父节点 auto=true，
+#    而 dispatcher 的 assert(not track.dependent or not track.auto) 会拒绝这类节点。
+#    所以必须保留原 entry({...}) 作为真实节点并 .hidden = true，
+#    菜单入口另行注册到 admin/system/store，而不是把原 entry 挪走。
+#
+#  本脚本排序在 05-istore-bootstrap 之后，保证 store.lua 已被 opkg 装好。
+# ===========================================================================
+
+F=/usr/lib/lua/luci/controller/store.lua
+OLD='entry({"admin", "store"}, call("redirect_index"), _("iStore"), 31)'
+
+[ -f "$F" ] || { echo "store.lua 不存在，跳过"; exit 0; }
+grep -qF "$OLD" "$F" || { echo "锚点不匹配（可能已被上游改动），跳过"; exit 0; }
+
+# sed 正则元字符转义
+ESC=$(printf '%s' "$OLD" | sed 's/[][\.*^$/]/\\&/g')
+
+cp -a "$F" "$F.orig"
+# 行首缩进用 [[:space:]]* 容忍（原始文件中该行带 4 个空格缩进）；
+# 替换文本里用 \n 换行（busybox sed 与 GNU sed 均支持）
+sed -i "s|^[[:space:]]*$ESC[[:space:]]*\$|local _istore_home = $OLD\n_istore_home.hidden = true\nentry({\"admin\", \"system\", \"store\"}, call(\"redirect_index\"), _(\"iStore\"), 90)|" "$F"
+
+# 语法校验，失败即回滚（保证不会把固件改崩）
+if command -v lua >/dev/null 2>&1; then
+	if ! lua -e "assert(loadfile('$F'))" 2>/dev/null; then
+		echo "!! 语法校验失败，已回滚"
+		mv -f "$F.orig" "$F"
+		exit 1
+	fi
+fi
+rm -f "$F.orig"
+
+# 清 LuCI 双层缓存，否则改了也不生效
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+rm -rf /tmp/luci-modulecache
+echo "iStore 菜单已移到 系统 → iStore"
+exit 0

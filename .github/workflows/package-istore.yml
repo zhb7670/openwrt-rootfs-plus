@@ -1,24 +1,48 @@
 # =============================================================================
-#  在 rootfs 里预装 iStore 应用商店 + 修正菜单层级
+#  在 rootfs 里注入三项定制（不改 F大/海碧 的 rootfs，本地解包后注入，重打包）：
+#    A. 预装 iStore 应用商店
+#    B. 修复 iStore 在 ifit 主题下的侧边栏菜单（裸文字 → 有图标）
+#    C. 修复 DDNS-GO 的 LuCI 菜单（官方 menu.d 架构在本固件上不显示）
 #
-#  做法（不改F大/海碧的 rootfs，本地解包后注入，重打包）：
+#  做法：
 #    1. 下载 ophub 的 rootfs
 #    2. 解到临时目录
-#    3. 加入 iStore 软件源 + 预装 luci-app-store 及其依赖包
-#    4. 修正 store.lua 菜单层级：admin/store → admin/system/store
-#       （与 autoreboot/diskman 等插件一致，让它挂在"系统"下面）
-#    5. 重新打包成rootfs.tar.gz 交回 flippy 出固件
+#    3. 加入 iStore 软件源；把 6 个 ipk 原样放进 /usr/share/istore-bootstrap/
+#    4. 写入 /etc/uci-defaults/ 钩子：首次启动时由目标系统自带的 opkg 真正安装
+#    5.（可选）把 store.lua 菜单从 admin/store 挪到 admin/system/store
+#    6. 给 ifit 主题补上 iStore 顶层菜单的图标与缩进（否则它在侧边栏是"裸文字"）
+#    7. 预置 DDNS-GO 的老式 LuCI controller + view，并写入启用钩子
+#    8. 重新打包成 rootfs.tar.gz 交回 flippy 出固件
 #
-#  为什么预装而不是让用户自己装：
-#    - 用户反馈"界面不统一"——iStore 默认注册成 admin/store 会顶到侧边栏最顶层
-#    - 预装时直接改好层级，刷机即统一
-#    - 用户仍可在商店里更新 luci-app-store（更新会还原菜单路径，属可接受代价）
+#  ⚠️ 关键历史教训（v1 的 bug，务必不要回退成"解包铺文件"）：
+#    v1 用 `ar x` + `tar xzf data.tar.gz -C $ROOT` 直接把文件铺进 rootfs，
+#    这**绕过了 opkg**，导致三个致命缺失：
+#      a) 包没登记进 opkg 数据库 → is-opkg 自升级检测报 "Check version failed!"
+#      b) Alternatives 不处理 → coreutils-stty 的 /bin/stty 是 opkg 建出来的软链，
+#         data.tar.gz 里根本没有，所以 /bin/stty 永远不存在
+#      c) 漏了 taskd 的两个运行时依赖 script-utils / coreutils-stty
+#         → /usr/libexec/taskd 执行 `exec script ...` 报 "script: not found"
+#         → 任何"点安装"都 exit 127 秒失败（这才是"点安装直接失败"的真正原因）
+#    另外 v1 把 control.tar.gz 解到 $ROOT 根目录，循环覆盖后留下
+#    /control /postinst /postinst-pkg /prerm /conffiles 一堆垃圾。
 #
-#  依赖包（Architecture: all，跨架构通用）：
-#    luci-app-store0.2.1-r1  taskd 1.0.3-2  luci-lib-taskd 1.0.26  luci-lib-xterm 4.18.0
-#    script-utils  coreutils-stty（后两个来自 lede 官方源）
+#  依赖链（必须完整，缺一不可）：
+#    luci-app-store 0.2.1-r1
+#      └─ luci-lib-taskd 1.0.26
+#           ├─ luci-lib-xterm 4.18.0
+#           └─ taskd 1.0.3-2
+#                └─ script-utils（提供 /usr/bin/script）
+#                └─ coreutils-stty（提供 /usr/libexec/stty-coreutils + /bin/stty 软链）
+#
+#  ⚠️ DDNS-GO 为什么也要改（不是坏了，是架构不匹配）：
+#    rootfs 里 ddns-go(6.15.0-1) 与 luci-app-ddns-go(1.6.5) 其实都装好了，
+#    但官方 luci-app-ddns-go 是"menu.d/*.json + resources/view/*.js"新架构，
+#    而本固件的 createindex() 只扫 /usr/lib/lua/luci/controller/*.lua、不读 menu.d，
+#    dispatcher.lua 也没有 view() 函数 → 官方菜单天生不出现。
+#    解法：补一个老式 controller + 一个内嵌 ddns-go 自带 WebUI(:9876) 的 view，
+#         并把 ddns-go 的 enabled 打开（默认关着 → 不建实例 → 9876 不监听）。
 # =============================================================================
-name: Package N1 & X96Max+ (with iStore, unified menu)
+name: Package N1 & X96Max+ (with iStore + DDNS-GO)
 
 on:
   workflow_dispatch:
@@ -39,6 +63,10 @@ on:
         description: "镜像压缩方式"
         required: false
         default: "gz"
+      istore_menu:
+        description: "把 iStore 菜单从顶层挪到「系统」下面（true/false）"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
@@ -52,7 +80,7 @@ env:
 
 jobs:
   build:
-    name: 打包固件（含 iStore + 统一菜单）
+    name: 打包固件（含 iStore）
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 90
     steps:
@@ -67,26 +95,47 @@ jobs:
           sudo apt-get install -y btrfs-progs dosfstools e2fsprogs util-linux uuid-runtime \
             fdisk parted gawk tar pigz p7zip-full rsync wget curl jq xz-utils
 
-      - name: 准备依赖包（iStore + taskd 等）
+      - name: 准备依赖包（iStore + taskd + script-utils + coreutils-stty）
         run: |
           set -e
           mkdir -p pkg
-          BASE="https://istore.istoreos.com/repo/all/store"
-          LEDE="https://mirrors.tencent.com/lede/releases/24.10.3/packages/aarch64_generic"
-          # iStore 商店（all 架构，跨平台）
+          ISTORE="https://istore.istoreos.com/repo/all/store"
+          LEDE_ROOT="https://mirrors.tencent.com/lede/releases/24.10.3/packages"
+          LEDE_ARCH="aarch64_generic"
+
+          # ① iStore 商店本体（Architecture: all，跨架构通用）
           for f in luci-app-store_0.2.1-r1_all.ipk \
                    taskd_1.0.3-2_all.ipk \
                    luci-lib-taskd_1.0.26_all.ipk \
                    luci-lib-xterm_4.18.0_all.ipk; do
             echo "下载 $f"
-            curl -fSL --retry 3 "$BASE/$f" -o "pkg/$f"
+            curl -fSL --retry 3 "$ISTORE/$f" -o "pkg/$f"
           done
-          # lede 官方依赖（按需调整版本号，用 opkg 索引核对）
-          for f in $(curl -fsSL "$LEDE/base/Packages.gz" | gunzip | \
-                     awk '/^Package: script-utils$/{f=1} f&&/^Filename:/{print $2; exit}'); do
-            curl -fSL --retry 3 "$LEDE/../$f" -o "pkg/$(basename $f)" 2>/dev/null || true
-          done
+
+          # ② 上游官方依赖（taskd 运行时必需，v1 漏了 coreutils-stty）
+          #    注意：Packages.gz 里的 Filename 是"相对本 feed 目录"的（如
+          #    script-utils_2.40.2-r1_aarch64_generic.ipk），不带 base/ 前缀，
+          #    所以拼 URL 时必须把 $feed 补回去。
+          #    取不到包直接报错退出（v1 用 `|| true` 把失败吞掉了）。
+          fetch() {
+            feed="$1"; name="$2"
+            meta=$(curl -fsSL "$LEDE_ROOT/$LEDE_ARCH/$feed/Packages.gz" | gunzip | \
+                   awk -v n="$name" '$1=="Package:" && $2==n {p=1}
+                                     p && $1=="Filename:" {fn=$2}
+                                     p && $1=="SHA256sum:" {print fn" "$2; exit}')
+            [ -n "$meta" ] || { echo "::error::在 $feed 索引里找不到包 $name"; exit 1; }
+            fn=${meta%% *}; sum=${meta##* }
+            fn=${fn#./}
+            echo "下载 $name  <=  $feed/$fn"
+            curl -fSL --retry 3 "$LEDE_ROOT/$LEDE_ARCH/$feed/$fn" -o "pkg/$(basename "$fn")"
+            echo "$sum  pkg/$(basename "$fn")" | sha256sum -c -
+          }
+          fetch base     script-utils
+          fetch packages coreutils-stty
+
+          echo "===== 依赖包清单 ====="
           ls -lh pkg/
+          [ "$(ls pkg/*.ipk | wc -l)" -eq 6 ] || { echo "::error::ipk 数量不是 6"; exit 1; }
 
       - name: 解包 rootfs
         env:
@@ -112,7 +161,7 @@ jobs:
           echo "解包完成，根目录："
           ls rw | head
 
-      - name: 注入 iStore 软件源与预装包
+      - name: 注入 iStore 软件源与预置 ipk
         run: |
           set -e
           ROOT=""
@@ -126,38 +175,78 @@ jobs:
           echo "src/gz istore https://istore.istoreos.com/repo/all/store" \
             >> "$ROOT/etc/opkg/distfeeds.conf"
 
-          # 2) 预装 ipk（ar x 解出 data.tar.gz 再解到 rootfs）
-          for ipk in pkg/*.ipk; do
-            [ -e "$ipk" ] || continue
-            echo "--- 解包 $ipk"
-            rm -rf /tmp/ipk && mkdir -p /tmp/ipk
-            ( cd /tmp/ipk && ar x "$OLDPWD/$ipk" 2>/dev/null || tar xzf "$OLDPWD/$ipk" 2>/dev/null )
-            if [ -f /tmp/ipk/data.tar.gz ]; then
-              tar xzf /tmp/ipk/data.tar.gz -C "$ROOT"
-            elif [ -f /tmp/ipk/data.tar ]; then
-              tar xf  /tmp/ipk/data.tar  -C "$ROOT"
-            fi
-            # 处理 control（postinst 可能需要，这里只保留文件，配置交由首次启动生成）
-            [ -f /tmp/ipk/control.tar.gz ] && tar xzf /tmp/ipk/control.tar.gz -C "$ROOT" || true
-          done
-          echo "注入完成"
-          ls "$ROOT/usr/lib/lua/luci/controller/store.lua" 2>/dev/null || echo "⚠️store.lua 未找到"
+          # 2) 把 ipk 原样放进固件，交给首次启动的 opkg 安装
+          #    （千万不要在这里解包铺文件，原因见文件头注释）
+          mkdir -p "$ROOT/usr/share/istore-bootstrap"
+          cp -v pkg/*.ipk "$ROOT/usr/share/istore-bootstrap/"
+          ls -lh "$ROOT/usr/share/istore-bootstrap/"
 
-      - name: 首次启动清理 LuCI 缓存（让预装菜单生效）
+      - name: 注入 DDNS-GO 的老式 LuCI 入口
         run: |
           set -e
           ROOT=""
           for d in rw rw/*/; do
             if [ -f "$d/etc/opkg/distfeeds.conf" ]; then ROOT="$d"; break; fi
           done
-          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录（找 etc/opkg/distfeeds.conf）"; exit 1; }
+          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录"; exit 1; }
           echo "rootfs 根目录: $ROOT"
+
+          # 1) 预置静态文件（老式 controller + 内嵌 iframe 的 view）
+          cp -av ddnsgo-luci/rootfs/. "$ROOT/"
+          # 兜底：干掉可能混进来的 CRLF（CRLF 会让 Lua/shell 在设备上异常）
+          find "$ROOT/usr/lib/lua/luci/controller/ddns-go.lua" "$ROOT/usr/lib/lua/luci/view/ddns-go" \
+               -type f -exec sed -i 's/\r$//' {} +
+          ls -l "$ROOT/usr/lib/lua/luci/controller/ddns-go.lua" \
+                "$ROOT/usr/lib/lua/luci/view/ddns-go/ddns-go.htm"
+
+          # 2) 顺手把 enabled 写进出厂 /etc/config/ddns-go（双保险，钩子里还会再压一次）
+          if [ -f "$ROOT/etc/config/ddns-go" ]; then
+            if grep -qE "^\s*option\s+enabled\s" "$ROOT/etc/config/ddns-go"; then
+              sed -i -E "s/^(\s*option\s+enabled\s+).*/\1'1'/" "$ROOT/etc/config/ddns-go"
+            else
+              sed -i -E "s/^(\s*option\s+dns\s+.*)$/\1\n\toption enabled '1'/" "$ROOT/etc/config/ddns-go"
+            fi
+            echo "----- /etc/config/ddns-go -----"
+            cat "$ROOT/etc/config/ddns-go"
+          else
+            echo "::warning::rootfs 里没有 /etc/config/ddns-go（ddns-go 包可能不在这个 rootfs）"
+          fi
+
+      - name: 写入首次启动钩子（uci-defaults）
+        run: |
+          set -e
+          ROOT=""
+          for d in rw rw/*/; do
+            if [ -f "$d/etc/opkg/distfeeds.conf" ]; then ROOT="$d"; break; fi
+          done
+          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录"; exit 1; }
+          echo "rootfs 根目录: $ROOT"
+
           mkdir -p "$ROOT/etc/uci-defaults"
-          # 用 printf 而非 heredoc：heredoc 内容若不缩进会破坏 YAML 块结构
-          printf '#!/bin/sh\nrm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null\nexit 0\n' \
-            > "$ROOT/etc/uci-defaults/99-luci-refresh"
-          chmod +x "$ROOT/etc/uci-defaults/99-luci-refresh"
-          cat "$ROOT/etc/uci-defaults/99-luci-refresh"
+          install -m 0755 istore-bootstrap/05-istore-bootstrap "$ROOT/etc/uci-defaults/05-istore-bootstrap"
+          # 96 必须在 95 之后、99 之前：先挪菜单（可选），再补 ifit 的 iStore 图标，最后清缓存
+          install -m 0755 istore-bootstrap/96-istore-menu-icon "$ROOT/etc/uci-defaults/96-istore-menu-icon"
+          # zz- 开头：uci-defaults 按字母序执行，zz 排最后，保证压过 ddns-go 包自带的 luci-ddns-go
+          install -m 0755 ddnsgo-luci/zz-ddnsgo-luci "$ROOT/etc/uci-defaults/zz-ddnsgo-luci"
+          install -m 0755 istore-bootstrap/99-luci-refresh   "$ROOT/etc/uci-defaults/99-luci-refresh"
+
+          if [ "${{ inputs.istore_menu }}" = "true" ]; then
+            echo "启用：把 iStore 菜单挪到「系统」下面"
+            install -m 0755 istore-bootstrap/95-istore-menu-move "$ROOT/etc/uci-defaults/95-istore-menu-move"
+          else
+            echo "保持 iStore 菜单原样（admin/store 顶层）"
+          fi
+
+          echo "===== uci-defaults 内容 ====="
+          ls -l "$ROOT/etc/uci-defaults/"
+
+          # 兜底：所有首启钩子必须是 LF，否则 #!/bin/sh\r 在设备上直接失效
+          for f in "$ROOT"/etc/uci-defaults/*; do sed -i 's/\r$//' "$f"; done
+          echo "----- shebang 字节检查（应为 #!/bin/sh + LF）-----"
+          head -c 12 "$ROOT/etc/uci-defaults/05-istore-bootstrap" | od -c
+
+          echo "----- 05-istore-bootstrap -----"
+          cat "$ROOT/etc/uci-defaults/05-istore-bootstrap"
 
       - name: 重新打包 rootfs
         run: |
@@ -166,7 +255,7 @@ jobs:
           for d in rw rw/*/; do
             if [ -f "$d/etc/opkg/distfeeds.conf" ]; then ROOT="$d"; break; fi
           done
-          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录（找 etc/opkg/distfeeds.conf）"; exit 1; }
+          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录"; exit 1; }
           echo "rootfs 根目录: $ROOT"
           OUT="opt/download/$ROOTFS"
           rm -f "$OUT"
@@ -209,7 +298,7 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           tag: N1-X96MaxPlus-iStore
-          name: "OpenWrt for N1 & X96Max+（含 iStore 应用商店）"
+          name: "OpenWrt for N1 & X96Max+（含 iStore + DDNS-GO）"
           allowUpdates: true
           removeArtifacts: true
           artifacts: firmware/*
@@ -217,12 +306,37 @@ jobs:
           body: |
             ### 本次打包
             - 基于 F大官方 rootfs（ophub）
-            - **已预装 iStore 应用商店**，并把菜单从顶层移到 **系统** 下面，与其它插件层级一致
             - 内核：`${{ inputs.kernel_version }}`（ophub/kernel）
             - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
 
-            ### 关于菜单位置
-            iStore 官方注册路径为 `admin/store`，会显示在侧边栏**顶层**（与"状态/系统"平级）。
-            这是上游插件自身的设计，**改它会导致页面路由失效**（实测报
-            `No page is registered at '/admin/store/pages/store'`），故**保持原样不做修改**。
-            如需访问请直接开：`http://<你的IP>/cgi-bin/luci/admin/store/main`
+            ### 已注入的三项定制
+
+            **① iStore 安装方式（已修正）**
+            iStore 不再"解包铺文件"，而是把 6 个官方 ipk 预置到
+            `/usr/share/istore-bootstrap/`，**首次开机由系统自带的 opkg 真正安装**。
+            完整依赖链：`script-utils` + `coreutils-stty` → `taskd` → `luci-lib-taskd`
+            → `luci-lib-xterm` → `luci-app-store`。
+            这样 `/bin/stty` 软链、opkg 数据库登记、首次初始化脚本都会正确执行，
+            「点安装插件」不会再秒失败。
+            首次开机日志见 `/tmp/istore-bootstrap.log`。
+
+            **② iStore 菜单外观（ifit 主题）**
+            ifit 的侧边栏图标是**按 `data-title` 硬编码**在 `style.css` 里的，而
+            iStore 是全菜单里唯一"没有子菜单的顶层项"，不在那张表里 —— 结果就是
+            无图标、文字贴最左边，与其它菜单不协调。
+            现由 `/etc/uci-defaults/96-istore-menu-icon` 在首次开机自动补上
+            （照抄主题中 Logout 的同款写法，图标取 icomoon `\e903` extension）。
+
+            **③ DDNS-GO 的 LuCI 菜单**
+            rootfs 里 `ddns-go(6.15.0-1)` 与 `luci-app-ddns-go(1.6.5)` 其实都装好了，
+            但官方 App 用的是 `menu.d/*.json + resources/view/*.js` 新架构，
+            而本固件的 `createindex()` 只扫 `controller/*.lua`、不读 menu.d，
+            `dispatcher.lua` 也没有 `view()` → 菜单**天生不出现**（不是坏了）。
+            现预置一个老式 `controller/ddns-go.lua` + 内嵌 ddns-go 自带 WebUI(:9876)
+            的 `view/ddns-go/ddns-go.htm`，并由 `/etc/uci-defaults/zz-ddnsgo-luci`
+            在首次开机把 `ddns-go.config.enabled` 打开、设为开机自启。
+            刷完后菜单路径：**服务 → DDNS-GO**。
+
+            ### iStore 菜单位置
+            默认保持 iStore 上游原样（`admin/store`，显示在侧边栏顶层）。
+            需要挪到「系统」下面时，重新触发 workflow 并把 `istore_menu` 设为 `true`。

@@ -1,0 +1,8 @@
+#!/bin/sh
+# 清 LuCI 双层缓存，让预装/改动的菜单在首次启动即生效。
+# 背景：/usr/lib/lua/luci/ccache.lua 把编译后的字节码缓存到
+#       /tmp/luci-modulecache/<模块名HEX>，且没有 mtime 校验，命中就永久返回旧字节码。
+#       所以改了控制器却不生效时，必须同时删掉 indexcache 与 modulecache。
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+rm -rf /tmp/luci-modulecache
+exit 0

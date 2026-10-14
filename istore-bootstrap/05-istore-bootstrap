@@ -1,0 +1,53 @@
+#!/bin/sh
+# ===========================================================================
+#  iStore 首次安装钩子
+#  由 /etc/init.d/boot 的 uci_apply_defaults() 在首次启动时执行（START=10）
+#
+#  为什么不能"解包 data.tar.gz 直接铺文件"：
+#    opkg install 除了解包，还额外做三件直接铺文件做不到的事 ——
+#      1) 登记 /usr/lib/opkg/status 与 /usr/lib/opkg/info/<pkg>.{control,list}
+#         → 不做的话 is-opkg check_self_upgrade 会报 "Check version failed!"
+#      2) 处理 Alternatives
+#         → coreutils-stty 的 data.tar.gz 里只有 /usr/libexec/stty-coreutils，
+#           /bin/stty 是 opkg 装完后按 Alternatives 建的软链，铺文件永远不会出现！
+#      3) 生成 <pkg>.list 并执行 /etc/uci-defaults/<pkg>
+#         → luci-app-store 的首次初始化（/etc/.app_store.id、super_arch、
+#           /tmp/run/istore-meta → /usr/lib/opkg 软链）全在这里面
+#
+#  顺序不能乱：taskd 的 Depends 是 script-utils + coreutils-stty，
+#  iStore 的"点安装秒失败"就是因为缺这两个包 → /usr/libexec/taskd 里的
+#  `exec script ...` 报 "script: not found" → 任务 exit 127。
+#
+#  本脚本在 START=10 执行，早于网络（S20）。上面所有依赖都已在基础 rootfs 中，
+#  所以整个过程完全离线可完成；任何一步失败都会返回非 0，被 boot 保留到下次启动重试。
+# ===========================================================================
+
+LOG=/tmp/istore-bootstrap.log
+exec >>"$LOG" 2>&1
+echo "=== istore-bootstrap start: $(date) ==="
+
+D=/usr/share/istore-bootstrap
+rc=0
+
+for p in script-utils coreutils-stty taskd luci-lib-xterm luci-lib-taskd luci-app-store; do
+	ipk=$(ls "$D/${p}_"*.ipk 2>/dev/null | head -n1)
+	if [ -z "$ipk" ]; then
+		echo "!! 缺少预置 ipk: $p"
+		rc=1
+		continue
+	fi
+	echo "--- opkg install $ipk"
+	opkg install "$ipk" || { echo "!! 安装失败: $p"; rc=1; }
+done
+
+# 让 LuCI 立刻识别新菜单（iStore 的 postinst-pkg 也做这件事，这里补齐）
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+rm -rf /tmp/luci-modulecache
+/etc/init.d/rpcd reload 2>/dev/null
+
+echo "=== istore-bootstrap done: rc=$rc ==="
+
+# 成功后自清理，不长期占用 flash
+[ "$rc" = "0" ] && rm -rf "$D"
+
+exit $rc

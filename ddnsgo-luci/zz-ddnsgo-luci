@@ -1,0 +1,38 @@
+#!/bin/sh
+# 为 flippy/LEDE 老式 LuCI 补上 DDNS-GO 的菜单入口，并确保服务被启用。
+#
+# 【背景】
+#   rootfs 里其实已经装好了 ddns-go(6.15.0-1) 与 luci-app-ddns-go(1.6.5)，
+#   但官方 luci-app-ddns-go 用的是
+#     /usr/share/luci/menu.d/luci-app-ddns-go.json  +  /www/luci-static/resources/view/ddns-go/*.js
+#   而本固件的 createindex() 只扫 /usr/lib/lua/luci/controller/*.lua、不读 menu.d，
+#   dispatcher.lua 里也没有 view() 函数
+#   → 官方菜单在这类固件上【天生不出现】（不是坏了，是架构不匹配）。
+#
+# 【本脚本做什么】
+#   1) 打开 ddns-go 的 enabled（否则 init 里 `[[ x$enabled = x1 ]] || return 1`
+#      → 不创建实例，状态是 "active with no instances"，9876 也不监听）
+#   2) 把 ddns-go 设为开机自启
+#   （LuCI 的 controller + view 两个文件已由打包流程直接预置进 rootfs，
+#     见 ddnsgo-luci/rootfs/usr/lib/lua/luci/）
+#
+# 【为什么叫 zz- 开头】
+#   本固件的 uci-defaults 由 /etc/init.d/boot 里的 uci_apply_defaults() 按 `ls`
+#   字母序逐个 source 执行。ddns-go 包自带一个 /etc/uci-defaults/luci-ddns-go，
+#   字母开头；数字前缀（如 20-）会排在它【前面】，可能被它随后覆盖。
+#   用 zz- 保证我们最后执行，稳稳压过包自带的默认值。
+#   （boot 是 START=10，rcS 是 START=95，所以这里 enable 的服务本次开机就会起来。）
+
+C=/etc/config/ddns-go
+
+[ -x /usr/bin/ddns-go ] || exit 0     # 没装 ddns-go 就直接跳过
+
+# 1) 确保 basic 段存在，并把 enabled 打开
+uci -q get ddns-go.config >/dev/null 2>&1 || uci set ddns-go.config=basic 2>/dev/null
+uci set  ddns-go.config.enabled='1'
+uci commit ddns-go
+
+# 2) 开机自启
+[ -x /etc/init.d/ddns-go ] && /etc/init.d/ddns-go enable 2>/dev/null
+
+exit 0
