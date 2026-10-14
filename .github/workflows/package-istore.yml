@@ -18,7 +18,7 @@
 #    5.（可选）把 store.lua 菜单从 admin/store 挪到 admin/system/store
 #    6. 给 ifit 主题补上 iStore 顶层菜单的图标与缩进（否则它在侧边栏是"裸文字"）
 #    7. 预置 DDNS-GO 的老式 LuCI controller + view，并写入启用钩子
-#    8. 写入 /etc/hotplug.d/ieee80211/05-wifi-path-fix（无线路径自愈）
+#    8. 写入 /etc/hotplug.d/ieee80211/05-wifi-path-fix（无线路径自愈，含改完 reload）
 #    9. 重新打包成 rootfs.tar.gz 交回 flippy 出固件
 #   10. 预置打好补丁的 openwrt_packit 到 /opt，把根分区 ROOTFS 扩到 4096MB
 #
@@ -26,10 +26,19 @@
 #    内核 6.x 把 Amlogic mmc 控制器的 sysfs 名从 ffe03000.sd 改成了 ffe03000.mmc。
 #    从旧系统带过来的 /etc/config/wireless 里写死的老路径在新内核上永远匹配不到 phy
 #    → radioN 报 "up": false, "retry_setup_failed": true；同时 10-wifi-detect 会以为
-#    "这颗 phy 没人认领"，自动补一条 LEDE 开放网络顶上来，用户的 SSID 就消失了。
+#    "这颗 phy 没人认领"，自动补一条 OpenWrt 开放网络顶上来，用户的 SSID 就消失了。
 #    uci-defaults 在 /etc/init.d/boot 里执行得太早（SDIO 网卡还没枚举完，
 #    /etc/config/wireless 往往还不存在），所以必须挂 hotplug 的 add 事件，
 #    并且用 05 前缀排在 10-wifi-detect 之前，先修好再让 detect 判重。
+#
+#  ⚠️ D 的第二个坑（曾经的真 bug，已修）：**改完文件必须主动 reload**。
+#    netifd 在 boot 早期就已经读过 /etc/config/wireless 并 `wifi up` 过一次 —— 那时读到的
+#    还是**没修的 .sd 路径**，所以 radio0 认领不到 phy。钩子虽然在 phy 出现的时刻（约开机
+#    28 秒）把文件改对了，但**只改文件不会让 netifd 重读**，于是本次开机 radio0 会一直停在
+#    "up": false, "retry_setup_failed": true，无线全程是死的（不是"下次重启就好"，是这次就是死的）。
+#    所以钩子末尾必须：`( sleep 8; /sbin/wifi reload ) >/dev/null 2>&1 &`
+#    —— 延迟 8 秒让 10-wifi-detect 先跑完，避免两边同时写配置；后台执行不阻塞 hotplug。
+#    实测：不 reload → 无线全程死；reload 后立刻 "up": true、SSID 正常广播、扫描可用。
 #
 #  ⚠️ E 的原因：uhttpd 只发 ETag / Last-Modified，**不发 Cache-Control / Expires**。
 #    按 RFC 7234 §4.2.2 浏览器会做"启发式缓存"，有效期约 (缓存时刻 - Last-Modified)
@@ -289,6 +298,8 @@ jobs:
           # uci-defaults 在 /etc/init.d/boot 里跑得太早，那时 SDIO 网卡还没枚举完、
           # /etc/config/wireless 往往还不存在。hotplug 的 add 事件才是网卡刚上线的时刻，
           # 而且 05 排在 10-wifi-detect 之前，修完再让 detect 去判重，就不会多补一个 radio。
+          # ★ 脚本内部改完配置后还会主动 `( sleep 8; /sbin/wifi reload )` —— 这一步不能省，
+          #   否则 netifd 不会重读，刷机后第一次开机 radio 会一直是 down 的。
           mkdir -p "$ROOT/etc/hotplug.d/ieee80211"
           install -m 0755 system-fixes/05-wifi-path-fix "$ROOT/etc/hotplug.d/ieee80211/05-wifi-path-fix"
 
@@ -532,10 +543,14 @@ jobs:
             `6.1.x` 是 `platform/soc/ffe03000.sd/...`，`6.18.x` 是 `platform/soc/ffe03000.mmc/...`。
             如果 `/etc/config/wireless` 是从旧系统带过来的（恢复配置备份），里面写死的老路径
             在新内核上**永远匹配不到 phy** → `radioN` 报 `"up": false, "retry_setup_failed": true`；
-            同时 `10-wifi-detect` 会以为"这颗 phy 没人认领"，自动补一条 `LEDE` 开放网络顶上来
+            同时 `10-wifi-detect` 会以为"这颗 phy 没人认领"，自动补一条 `OpenWrt` 开放网络顶上来
             —— 表现就是"我的 WiFi 不见了，多了个不认识的网络"。
             现由 `/etc/hotplug.d/ieee80211/05-wifi-path-fix` 在网卡上线时把
-            `ffeXXXXX.sd/` 批量改成 `ffeXXXXX.mmc/`，并在 `radio1` 与 `radio0` 同路径时删掉 `radio1`。
+            `ffeXXXXX.sd/` 批量改成 `ffeXXXXX.mmc/`，并在 `radio1` 与 `radio0` 同路径时删掉 `radio1`，
+            **最后主动 `/sbin/wifi reload` 一次**。
+            ⚠️ 那一次 reload 是必须的：netifd 在 boot 早期就已经用**没修的**配置 `wifi up` 过一次，
+            只改文件不会让它重读，本次开机 `radio0` 会一直停在 `"up": false`（无线全程是死的，
+            不是"重启一下就好"）。延迟 8 秒是为了让 `10-wifi-detect` 先跑完。
             放 `hotplug.d` 而非 `uci-defaults`：后者在 `/etc/init.d/boot` 里跑得太早，
             那时 SDIO 网卡还没枚举完、`/etc/config/wireless` 往往还不存在。
 

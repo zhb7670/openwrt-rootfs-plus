@@ -161,9 +161,21 @@ LuCI 的 `render_topmenu()` 对**没有子菜单的顶层项**输出的是裸 `<
 如果 `/etc/config/wireless` 是从旧系统带过来的（恢复配置备份），里面写死的老路径在新内核上
 **永远匹配不到 phy** → `radioN` 报 `"up": false, "retry_setup_failed": true`；
 同时 `/etc/hotplug.d/ieee80211/10-wifi-detect` 会以为"这颗 phy 没人认领"，自动补一条
-**`LEDE` 开放网络**顶上来 —— 用户看到的现象就是"我的 WiFi 不见了，多了个不认识的网络"。
+**`OpenWrt` 开放网络**顶上来 —— 用户看到的现象就是"我的 WiFi 不见了，多了个不认识的网络"。
 
-钩子做两件事：把 `ffeXXXXX.sd/` 批量改成 `ffeXXXXX.mmc/`；`radio1` 与 `radio0` 路径相同时删掉 `radio1`。
+钩子做**三件**事：
+
+1. 把 `ffeXXXXX.sd/` 批量改成 `ffeXXXXX.mmc/`
+2. `radio1` 与 `radio0` 路径相同时删掉 `radio1`
+3. **改完必须 reload**（`( sleep 8; /sbin/wifi reload ) &`）
+
+> **第 3 条是必须的，早期版本漏了它**（表现：刷机后第一次开机无线一直是死的）。
+> 原因：`netifd` 在 boot 早期就已经读过 `/etc/config/wireless` 并 `wifi up` 过一次 ——
+> 那时读到的是**没修的 `.sd` 路径**，所以 `radio0` 认领不到 phy。钩子虽然在 28 秒后
+> （phy 出现时）把文件改对了，但**只改文件不会让 netifd 重读**，于是本次开机
+> `radio0` 会一直停在 `"up": false, "retry_setup_failed": true`，必须主动 reload 一次。
+> 延迟 8 秒是为了让 `10-wifi-detect` 先跑完，避免两边同时写配置；
+> 全新刷机（路径本来就对）时钩子零动作，不会平白多一次 reload。
 
 > 为什么用 `hotplug.d` 而不是 `uci-defaults`：`uci-defaults` 在 `/etc/init.d/boot` 里执行得太早，
 > 那时 SDIO 网卡还没枚举完、`/etc/config/wireless` 往往还不存在。`05-` 前缀保证它排在

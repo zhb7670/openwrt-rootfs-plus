@@ -8,13 +8,23 @@
 # 如果 /etc/config/wireless 是从旧系统带过来的（恢复配置备份等），里面写死的
 # 老路径在新内核上永远匹配不到 phy -> radioN 报
 #   "up": false, "retry_setup_failed": true
-# 同时热插拔的 10-wifi-detect 会发现"这颗 phy 没人认领"，自动补一条新 radio，
-# 于是你的 SSID 消失、多出一个 LEDE 开放网络。
+# 同时热插拔的 10-wifi-detect 会发现"这颗 phy 没人认领"，自动补一条默认 radio，
+# 于是你的 SSID 消失、多出一个 OpenWrt 开放网络。
 #
 # 为什么放 /etc/hotplug.d/ieee80211/ 而不放 uci-defaults：
 #   uci-defaults 在 /etc/init.d/boot 里执行得太早，那时 SDIO 网卡还没枚举完，
 #   /etc/config/wireless 常常根本不存在。而 hotplug 的 add 事件正是网卡刚上线的
 #   时刻，且在 10-wifi-detect 之前（05 < 10），修完再让 detect 去判重。
+#
+# ⚠️ 为什么改完文件还必须 reload（v2 新增，这是 v1 的真 bug）：
+#   netifd（network 服务）在 boot 早期就已经读过 /etc/config/wireless 并
+#   `wifi up` 过一次了 —— 那时候读到的还是**没修的 .sd 路径**，所以 radio0 认领
+#   不到 phy。本脚本虽然在 28 秒后（phy 出现时）把文件改对了，但**只改文件不会
+#   让 netifd 重读**，于是本次开机 radio0 会一直停在
+#       "up": false, "retry_setup_failed": true
+#   必须主动 reload 一次。实测：不 reload → 无线全程死；reload 后立刻
+#   "up": true、SSID 正常广播、扫描可用。
+#   延迟 8 秒是为了让 10-wifi-detect 先跑完，避免两边同时写配置。
 # ============================================================================
 
 [ "${ACTION}" = "add" ] || exit 0
@@ -22,10 +32,13 @@
 W=/etc/config/wireless
 [ -f "$W" ] || exit 0
 
+NEED_RELOAD=0
+
 # ---- 1) 把过期的 .sd 路径改成 .mmc（不限定具体地址，适配各类 Amlogic 机型）----
 if grep -q 'ffe[0-9a-f]*\.sd/' "$W"; then
 	cp -a "$W" "$W.bak.$(date +%Y%m%d_%H%M%S)"
 	sed -i 's#\(ffe[0-9a-f]*\)\.sd/#\1.mmc/#g' "$W"
+	NEED_RELOAD=1
 	logger -t wifi-path-fix "已把过期的 .sd 路径修正为 .mmc"
 fi
 
@@ -37,7 +50,14 @@ if [ -n "$a" ] && [ "$a" = "$b" ]; then
 	uci -q delete wireless.radio1
 	uci -q delete wireless.default_radio1
 	uci -q commit wireless
+	NEED_RELOAD=1
 	logger -t wifi-path-fix "radio1 与 radio0 指向同一 phy，已删除 radio1"
+fi
+
+# ---- 3) 只要动过配置，就必须让 netifd 重读（否则本次开机无线是死的）----
+if [ "$NEED_RELOAD" = "1" ]; then
+	logger -t wifi-path-fix "8 秒后重载无线以应用修复"
+	( sleep 8; /sbin/wifi reload ) >/dev/null 2>&1 &
 fi
 
 exit 0
