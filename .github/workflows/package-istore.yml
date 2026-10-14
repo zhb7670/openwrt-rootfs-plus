@@ -286,11 +286,10 @@ jobs:
           cp -v "${PACKAGED_OUTPUTPATH}"/*.img.gz firmware/ 2>/dev/null || true
           [ -z "$(ls -A firmware 2>/dev/null)" ] && { echo "::error::无产出"; exit 1; }
           cd firmware
-          for f in *flippy*.img.gz; do
-            [ -e "$f" ] || continue
-            n=$(echo "$f" | sed -E 's/-flippy-[0-9]+[^.]*//')
-            [ "$f" != "$n" ] && mv -v "$f" "$n"
-          done
+          # 保留上游原始文件名（含 -flippy-95+o / -flippy-95+ 变体标记）：
+          # 「+o」和「+」是两支不同内核变体，改名会把这个信息抹掉，看起来四份一模一样。
+          echo "===== 镜像清单（上游原名，含 +o / + 变体标记）====="
+          for f in *.img.gz; do [ -e "$f" ] || continue; echo "  $f"; done
           sha256sum ./*.img.gz > sha256sums.txt 2>/dev/null || true
           ls -lh
 
@@ -311,6 +310,11 @@ jobs:
             - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
             - **产物 = 机型 × 内核系列**：本次为 2 机型 × 2 内核系列 = **4 个镜像**，
               **四个镜像都已注入下面三项定制**（注入发生在 rootfs 层，所有镜像共用同一份 rootfs）
+            - **文件名保留上游原始命名**，末尾的 `-flippy-95+o` / `-flippy-95+` 是两支不同的
+              内核变体：**`+o` 偏稳、`+` 偏新**（flippy 的两支构建，官方未正式定义，
+              社区资料通常说 `+o` 更稳、N1 等盒子更推荐）
+                同一内核系列下：`…k6.12.112-flippy-95+o.img.gz`（带 o）
+                              `…k6.18.56-flippy-95+.img.gz`（不带 o）
 
             ### 已注入的三项定制
 
