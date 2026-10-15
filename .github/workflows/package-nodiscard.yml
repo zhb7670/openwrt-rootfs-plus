@@ -261,6 +261,32 @@ jobs:
             echo "保持 iStore 菜单原样（admin/store 顶层）"
           fi
 
+          # ★ 方案A：刷机后 Docker 自动就位 + p3/p4 关 TRIM
+          #   上游 flippy 的 /etc/first_run.sh 开头有"现存分区必须正好 2 个"的守卫：
+          #       CURRENT_PT_CNT=$(parted /dev/$DISK print | awk '$1~/[1-9]+/{print $1}' | wc -l)
+          #       [ "$CURRENT_PT_CNT" != "2" ] && { echo "现存分区数量不为2,放弃!"; destory_myself; exit 1; }
+          #   只要卡上已经有 p3/p4（连刷两遍、或不是裸卡整卡 dd），它就**直接放弃**，
+          #   于是它后面那整段 docker 收尾一次都不执行：
+          #       · /opt/docker 软链没建  → UCI 默认 data_root='/opt/docker/' 会把
+          #                                 Docker 数据静默写到 1.25G 根分区
+          #       · dockerd 没被 enable   → /etc/rc.d 里没有 S99dockerd
+          #                                 → /var/run/docker.sock 永不出现
+          #                                 → `docker ps` 报
+          #                                   dial unix /var/run/docker.sock: connect: no such file or directory
+          #       · /etc/docker/daemon.json 留在 mmcblk2p4 出厂默认（不存在的 eMMC 分区）
+          #
+          #   为什么做成 START=97 的常驻 init 脚本，而不是 uci-defaults：
+          #     · uci-defaults 跑在 /etc/init.d/boot (START=10)，早于 S11 fstab 挂 p3/p4，
+          #       拿不到"必须在挂载之后"的时机；
+          #     · 首启的 first_run.sh 是在 S95 (rc.local) 才跑的，p3/p4 要等它建；
+          #     · 所以把核对点放在 S95 之后、S99 dockerd 之前 —— 即 START=97。
+          #   脚本本身幂等、只补不删、不动分区表、不格式化任何东西，永久退出码 0。
+          mkdir -p "$ROOT/usr/sbin" "$ROOT/etc/init.d" "$ROOT/etc/rc.d"
+          install -m 0755 system-fixes/docker-postinstall      "$ROOT/usr/sbin/docker-postinstall"
+          install -m 0755 system-fixes/docker-postinstall.init "$ROOT/etc/init.d/docker-postinstall"
+          ln -sf ../init.d/docker-postinstall "$ROOT/etc/rc.d/S97docker-postinstall"
+          echo "已注入 docker-postinstall（START=97）"
+
           echo "===== uci-defaults 内容 ====="
           ls -l "$ROOT/etc/uci-defaults/"
           echo "===== 无线自愈钩子 ====="
@@ -268,12 +294,30 @@ jobs:
 
           # 兜底：所有首启钩子必须是 LF，否则 #!/bin/sh\r 在设备上直接失效
           for f in "$ROOT"/etc/uci-defaults/* \
-                   "$ROOT"/etc/hotplug.d/ieee80211/05-wifi-path-fix; do
+                   "$ROOT"/etc/hotplug.d/ieee80211/05-wifi-path-fix \
+                   "$ROOT"/usr/sbin/docker-postinstall \
+                   "$ROOT"/etc/init.d/docker-postinstall; do
             sed -i 's/\r$//' "$f"
           done
           echo "----- shebang 字节检查（应为 #!/bin/sh + LF）-----"
           head -c 12 "$ROOT/etc/uci-defaults/05-istore-bootstrap" | od -c
           head -c 12 "$ROOT/etc/hotplug.d/ieee80211/05-wifi-path-fix" | od -c
+
+          echo "===== docker-postinstall 注入校验 ====="
+          ls -l "$ROOT/usr/sbin/docker-postinstall" \
+                "$ROOT/etc/init.d/docker-postinstall" \
+                "$ROOT/etc/rc.d/S97docker-postinstall"
+          [ -f "$ROOT/usr/sbin/docker-postinstall" ] \
+            || { echo "::error::/usr/sbin/docker-postinstall 没装上"; exit 1; }
+          [ -f "$ROOT/etc/init.d/docker-postinstall" ] \
+            || { echo "::error::/etc/init.d/docker-postinstall 没装上"; exit 1; }
+          [ "$(readlink "$ROOT/etc/rc.d/S97docker-postinstall")" = "../init.d/docker-postinstall" ] \
+            || { echo "::error::/etc/rc.d/S97docker-postinstall 软链不对"; exit 1; }
+          grep -q '^START=97' "$ROOT/etc/init.d/docker-postinstall" \
+            || { echo "::error::docker-postinstall 的 START 不是 97"; exit 1; }
+          grep -q 'usr/sbin/docker-postinstall' "$ROOT/etc/init.d/docker-postinstall" \
+            || { echo "::error::init 脚本没调用 /usr/sbin/docker-postinstall"; exit 1; }
+          echo "✅ docker-postinstall 注入就位"
 
           echo "----- 05-istore-bootstrap -----"
           cat "$ROOT/etc/uci-defaults/05-istore-bootstrap"
@@ -290,6 +334,17 @@ jobs:
           OUT="opt/download/$ROOTFS"
           rm -f "$OUT"
           tar czf "$OUT" -C "$ROOT" .
+
+          echo "===== 校验 rootfs.tar.gz 里确实有 docker-postinstall 三件套 ====="
+          for p in usr/sbin/docker-postinstall etc/init.d/docker-postinstall etc/rc.d/S97docker-postinstall; do
+            if tar tzf "$OUT" | grep -q "/$p$"; then
+              echo "  ok  $p"
+            else
+              echo "::error::重新打包的 rootfs.tar.gz 里缺少 $p"
+              exit 1
+            fi
+          done
+          echo "✅ rootfs.tar.gz 内容校验通过"
           ls -lh "$OUT"
 
       - name: ⑨ 给 openwrt_packit 打补丁（根分区 4096MB + nodiscard + 千兆 DTB）
@@ -372,6 +427,23 @@ jobs:
           assert hit1000 == 1, "没找到唯一的千兆 FDT 行（上游模板结构变了？）"
           io.open(f, "w", encoding="utf-8", newline="\n").write("".join(out))
           print("patched(DTB 100m->1000M):", f)
+
+          # ⑤ 【本工作流新增】first_run.sh 首启自建的 p3/p4，挂载时也要带 nodiscard
+          #    ③ 改的 rootflags 是 **per-mount**，只保护它启动的那个文件系统（/ = p2）。
+          #    首启且卡上只有 2 个分区时，p3/p4 是 first_run.sh 现建的，它的 mount 命令
+          #    里没有 nodiscard，内核 6.2+ 会在 p3/p4 上自动开 discard=async。
+          #    虽然 S97 的 docker-postinstall 会立刻 remount 把它关掉，
+          #    但这里顺手堵死，首启那几分钟也一并保护。
+          #    （p3/p4 两个 case 分支里的 btrfs mount 各一处，逐字唯一。）
+          f = "files/first_run.sh"
+          s = io.open(f, encoding="utf-8").read()
+          for _n in ("3", "4"):
+              _a = ('mount -t btrfs   "/dev/${PT_PRE}%s" "/mnt/${PT_PRE}%s"' % (_n, _n))
+              assert s.count(_a) == 1, "first_run.sh: p%s 的 btrfs mount 锚点不是唯一一处" % _n
+              s = s.replace(_a,
+                            'mount -t btrfs -o nodiscard "/dev/${PT_PRE}%s" "/mnt/${PT_PRE}%s"' % (_n, _n))
+          io.open(f, "w", encoding="utf-8", newline="\n").write(s)
+          print("patched(first_run nodiscard):", f)
           PY
 
           echo "===== 校验：分区尺寸应为 4 / 384 / 4096 ====="
@@ -399,6 +471,14 @@ jobs:
           if grep -qE '^FDT=.*-100m\.dtb$' mk_s905x3_multi.sh; then
             echo "::error::仍存在未注释的百兆 DTB"; exit 1
           fi
+          echo "===== 校验：first_run.sh 自建 p3/p4 时已带 nodiscard ====="
+          grep -n 'mount -t btrfs' files/first_run.sh
+          for _n in 3 4; do
+            grep -qF "mount -t btrfs -o nodiscard \"/dev/\${PT_PRE}$_n\" \"/mnt/\${PT_PRE}$_n\"" files/first_run.sh \
+              || { echo "::error::first_run.sh 的 p$_n mount 未带 nodiscard"; exit 1; }
+          done
+          echo "✅ first_run.sh p3/p4 mount 已带 nodiscard"
+
           echo "✅ 模板补丁就位：nodiscard（双机型）+ 千兆 DTB（X96Max+）"
 
           # 放进 /opt，并把属主交还 runner —— 否则后面
@@ -597,6 +677,29 @@ jobs:
 
             新版内核带更新的硬件支持与安全补丁。配上 ① 的 `nodiscard`，
             "新内核"与"老 TF 卡掉电不崩"这两件事从此可以兼得（本版即是验证样本）。
+
+            **④ 刷机后 Docker 自动就位（`docker-postinstall`）**
+
+            上游 flippy 的首启脚本 `/etc/first_run.sh` 开头有一段"现存分区必须正好 2 个"
+            的守卫；**只要刷机后卡上已经存在 p3/p4，它就整段放弃**，于是它后面的
+            docker 收尾一次都不跑 —— 现象就是刷完机 `docker ps` 报
+            `dial unix /var/run/docker.sock: connect: no such file or directory`，
+            而且 `/opt/docker` 变成普通空目录、Docker 数据会落到 1.25G 根分区。
+
+            本版把收尾独立成 `system-fixes/docker-postinstall`，装到
+            `/usr/sbin/docker-postinstall`，由 `START=97` 的
+            `/etc/init.d/docker-postinstall`（构建时即建好 `/etc/rc.d/S97…` 软链）
+            **每次开机**核对一遍，全部幂等、只补不删：
+
+            - 给 `/etc/config/fstab` 的 **p3 / p4** 补上 `option options 'nodiscard'`
+              （按 label `MMC_ROOTFS2` / `MMC_SHARED` 建，分区还没建也能先写好）
+            - 本次开机就 `mount -o remount,nodiscard` 把 p4 的 `discard` 立刻关掉
+            - `/opt/docker` 软链指向真实数据盘（非空目录一律改名保留，绝不静默丢数据）
+            - `dockerd` 开机自启 + UCI `data_root` + `/etc/docker/daemon.json` 一并纠正
+            - 若 `S99dockerd` 是本次新 enable 的（rcS 已错过它），当场手动 start 一次
+
+            顺带：`first_run.sh` 首启自建 p3/p4 时的 mount 也加了 `-o nodiscard`。
+            设备侧日志：`/tmp/docker-postinstall.log`。
 
             ### ★ 产物端到端校验（构建末尾自动执行，失败即整个 job 失败）
 
