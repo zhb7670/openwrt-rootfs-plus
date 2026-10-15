@@ -1,0 +1,749 @@
+# =============================================================================
+#  N1 / X96 Max+ 固件打包（iStore + DDNS-GO + nodiscard + 千兆网卡）—— 本工作流
+#
+#  与 package-istore.yml 的关系：本文件由它复制而来，**只做以下三处改动**
+#    ① 内核默认取最新：kernel_version 默认 6.18.y（kernel_flippy 里最新系列）
+#    ② rootflags 追加 ,nodiscard —— 关掉内核 6.2 起 btrfs 的自动异步 discard
+#    ③ X96 Max+ 的网卡 DTB：百兆 → 千兆
+#        上游默认   FDT=/dtb/amlogic/meson-sm1-x96-max-plus-100m.dtb   （百兆，未注释）
+#        本次改为   FDT=/dtb/amlogic/meson-sm1-x96-max-plus.dtb        （千兆，启用）
+#  其余（rootfs 六项注入、根分区 4096MB、iStore、DDNS-GO、无线自愈…）**与原工作流完全一致**。
+#
+#  ⚠️ 为什么必须加 nodiscard（2026-10-15 已用源码级证据定案）
+#    Linux 内核 **6.2** 起，btrfs 会对"支持 discard 的块设备"**自动开启** discard=async：
+#      · 官方文档 btrfs Feature-by-version：6.2 — discard=async on by default
+#        "Devices that support trim/discard will enable the asynchronous discard
+#         for the whole filesystem."
+#      · 内核维护者 David Sterba 的 6.2 合并请求（LKML 2022-12-12）"User visible
+#        features" 里明写：discard=async by default for devices that support it
+#      · **源码铁证** fs/btrfs/super.c：v6.1 无自动开启代码（只在用户显式传
+#        discard=async 时才开）；v6.12 新增 set_device_specific_options()，注释原文
+#        "For devices supporting discard turn on discard=async automatically, ...
+#         **This could be turned off by nodiscard for the same mount.**"
+#        → `nodiscard` 就是内核作者指定的关闭方式，本工作流用的正是它。
+#
+#    为什么这台盒子必须关：TF 卡是 2017 年生产的白牌卡（CID 12/3456 = Patriot/
+#    Gigastone 低成本 OEM 线，实测只跑到 SD high-speed 25MHz，连 UHS 都不支持），
+#    其 FTL 无掉电保护。持续 TRIM（SD 协议 = CMD38 ERASE）会不断擦写卡内映射表，
+#    断电撞上映射表更新中途即损坏 → 开机报 `BTRFS: csum failed root 256 ino 259`
+#    → 起不来。换成 6.1.163 内核（默认不发 TRIM）后，连续两次故意断电均正常恢复、
+#    三个 btrfs 分区 15 项错误计数全为 0 —— 这就是加 nodiscard 的依据。
+#    详细推导见仓库外的分析报告《TRIM与discard科普_内核6.2分界线源码实证.md》。
+#
+#  ⚠️ 机型与镜像数量的关系
+#    PACKAGE_SOC=s905x3_s905d → 每个内核系列出 2 个镜像（X96Max+ 与 N1 各一）。
+#    本次默认 6.18.y → 2 个镜像；写成 `6.12.y_6.18.y` 则 4 个。
+#    nodiscard 对**两个机型都打**（纯安全项）；千兆 DTB 只动 s905x3（N1 无此选项）。
+#
+# =============================================================================
+#  以下为原工作流说明（rootfs 注入部分，未改动）
+#    在 rootfs 里注入定制（不改 F大/海碧 的 rootfs，本地解包后注入，重打包）：
+#      A. 预装 iStore 应用商店
+#      B. 修复 iStore 在 ifit 主题下的侧边栏菜单（裸文字 → 有图标）
+#      C. 修复 DDNS-GO 的 LuCI 菜单（官方 menu.d 架构在本固件上不显示）
+#      D. 无线自愈：把旧配置里过期的 ffeXXXXX.sd 路径改成 ffeXXXXX.mmc
+#      E. ifit 样式表加版本后缀，避免浏览器启发式缓存导致补丁"看起来没生效"
+#      G. 根分区 ROOTFS 1280MB → 4096MB（打包参数，不在 rootfs 内）
+# =============================================================================
+name: Package N1 & X96Max+ (iStore + DDNS-GO + nodiscard + 千兆网卡)
+
+on:
+  workflow_dispatch:
+    inputs:
+      # 默认取最新内核系列；x.y.y 表示自动取该系列最新
+      #   6.18.y → 6.18.56（kernel_flippy 最新）
+      #   6.12.y → 6.12.112
+      #   6.1.y  → 6.1.163（该系列只有一个版本，且默认不发 TRIM）
+      # 多个系列用下划线分隔，如 `6.12.y_6.18.y`（每个系列出 2 个机型镜像）
+      kernel_version:
+        description: "内核系列（默认 6.18.y = 最新）。单个写 6.18.y；要多个用下划线分隔，如 6.12.y_6.18.y；每个系列都自动取该系列最新版"
+        required: false
+        default: "6.18.y"
+      openwrt_ver:
+        description: "固件版本号（写入文件名与 /etc/openwrt_release）"
+        required: false
+        default: "R26.03.25"
+      openwrt_ip:
+        description: "默认 LAN IP。⚠️ 已改为 192.168.100.1 —— 这台盒子的网段就是它；填 192.168.1.1 会与主路由 iKuai(192.168.1.10) 撞段"
+        required: false
+        default: "192.168.100.1"
+      gzip_imgs:
+        description: "镜像压缩方式"
+        required: false
+        default: "gz"
+      istore_menu:
+        description: "把 iStore 菜单从顶层挪到「系统」下面（true/false）"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nodiscard-package
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: 打包固件（iStore + nodiscard + 千兆网卡）
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: ① 检出仓库（取本地化脚本与资源）
+        uses: actions/checkout@v4
+
+      - name: ② 安装打包依赖（btrfs-progs/dosfstools/fdisk/pigz...）
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y btrfs-progs dosfstools e2fsprogs util-linux uuid-runtime \
+            fdisk parted gawk tar pigz p7zip-full rsync wget curl jq xz-utils
+
+      - name: ③ 下载 iStore 及其完整依赖链（6 个 ipk）
+        run: |
+          set -e
+          mkdir -p pkg
+          ISTORE="https://istore.istoreos.com/repo/all/store"
+          LEDE_ROOT="https://mirrors.tencent.com/lede/releases/24.10.3/packages"
+          LEDE_ARCH="aarch64_generic"
+
+          # ① iStore 商店本体（Architecture: all，跨架构通用）
+          for f in luci-app-store_0.2.1-r1_all.ipk \
+                   taskd_1.0.3-2_all.ipk \
+                   luci-lib-taskd_1.0.26_all.ipk \
+                   luci-lib-xterm_4.18.0_all.ipk; do
+            echo "下载 $f"
+            curl -fSL --retry 3 "$ISTORE/$f" -o "pkg/$f"
+          done
+
+          # ② 上游官方依赖（taskd 运行时必需，v1 漏了 coreutils-stty）
+          #    注意：Packages.gz 里的 Filename 是"相对本 feed 目录"的（如
+          #    script-utils_2.40.2-r1_aarch64_generic.ipk），不带 base/ 前缀，
+          #    所以拼 URL 时必须把 $feed 补回去。
+          #    取不到包直接报错退出（v1 用 `|| true` 把失败吞掉了）。
+          fetch() {
+            feed="$1"; name="$2"
+            meta=$(curl -fsSL "$LEDE_ROOT/$LEDE_ARCH/$feed/Packages.gz" | gunzip | \
+                   awk -v n="$name" '$1=="Package:" && $2==n {p=1}
+                                     p && $1=="Filename:" {fn=$2}
+                                     p && $1=="SHA256sum:" {print fn" "$2; exit}')
+            [ -n "$meta" ] || { echo "::error::在 $feed 索引里找不到包 $name"; exit 1; }
+            fn=${meta%% *}; sum=${meta##* }
+            fn=${fn#./}
+            echo "下载 $name  <=  $feed/$fn"
+            curl -fSL --retry 3 "$LEDE_ROOT/$LEDE_ARCH/$feed/$fn" -o "pkg/$(basename "$fn")"
+            echo "$sum  pkg/$(basename "$fn")" | sha256sum -c -
+          }
+          fetch base     script-utils
+          fetch packages coreutils-stty
+
+          echo "===== 依赖包清单 ====="
+          ls -lh pkg/
+          [ "$(ls pkg/*.ipk | wc -l)" -eq 6 ] || { echo "::error::ipk 数量不是 6"; exit 1; }
+
+      - name: ④ 拉取并解包 F大 rootfs（自动取 ophub 最新存档）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          rel=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                 "https://api.github.com/repos/ophub/flippy-openwrt-actions/releases?per_page=30" \
+               | jq -r '[.[] | select(.tag_name != "v0.1.0")
+                        | {tag:.tag_name,
+                           a:(.assets[]|select(.name|test("rootfs"))|{n:.name,u:.url})}
+                        | select(.a != null)]
+                    | sort_by(.a.n) | reverse | .[0]')
+          url=$(echo "$rel" | jq -r '.a.u')
+          name=$(echo "$rel" | jq -r '.a.n')
+          echo "rootfs: $name"
+          mkdir -p opt/download
+          curl -fSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+               "$url" -o "opt/download/$name"
+          echo "ROOTFS=$name" >> $GITHUB_ENV
+          rm -rf rw && mkdir rw
+          tar xzf "opt/download/$name" -C rw
+          echo "解包完成，根目录："
+          ls rw | head
+
+      - name: ⑤ 注入 iStore 软件源与 6 个预置 ipk
+        run: |
+          set -e
+          ROOT=""
+          for d in rw rw/*/; do
+            if [ -f "$d/etc/opkg/distfeeds.conf" ]; then ROOT="$d"; break; fi
+          done
+          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录（找 etc/opkg/distfeeds.conf）"; exit 1; }
+          echo "rootfs 根目录: $ROOT"
+
+          # 1) 追加 iStore 源
+          echo "src/gz istore https://istore.istoreos.com/repo/all/store" \
+            >> "$ROOT/etc/opkg/distfeeds.conf"
+
+          # 2) 把 ipk 原样放进固件，交给首次启动的 opkg 安装
+          #    （千万不要在这里解包铺文件，原因见文件头注释）
+          mkdir -p "$ROOT/usr/share/istore-bootstrap"
+          cp -v pkg/*.ipk "$ROOT/usr/share/istore-bootstrap/"
+          ls -lh "$ROOT/usr/share/istore-bootstrap/"
+
+      - name: ⑥ 注入 DDNS-GO 的老式 LuCI 控制器/视图
+        run: |
+          set -e
+          ROOT=""
+          for d in rw rw/*/; do
+            if [ -f "$d/etc/opkg/distfeeds.conf" ]; then ROOT="$d"; break; fi
+          done
+          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录"; exit 1; }
+          echo "rootfs 根目录: $ROOT"
+
+          # 1) 预置静态文件（老式 controller + 内嵌 iframe 的 view）
+          cp -av ddnsgo-luci/rootfs/. "$ROOT/"
+          # 兜底：干掉可能混进来的 CRLF（CRLF 会让 Lua/shell 在设备上异常）
+          find "$ROOT/usr/lib/lua/luci/controller/ddns-go.lua" "$ROOT/usr/lib/lua/luci/view/ddns-go" \
+               -type f -exec sed -i 's/\r$//' {} +
+          ls -l "$ROOT/usr/lib/lua/luci/controller/ddns-go.lua" \
+                "$ROOT/usr/lib/lua/luci/view/ddns-go/ddns-go.htm"
+
+          # 2) 顺手把 enabled 写进出厂 /etc/config/ddns-go（双保险，钩子里还会再压一次）
+          if [ -f "$ROOT/etc/config/ddns-go" ]; then
+            if grep -qE "^\s*option\s+enabled\s" "$ROOT/etc/config/ddns-go"; then
+              sed -i -E "s/^(\s*option\s+enabled\s+).*/\1'1'/" "$ROOT/etc/config/ddns-go"
+            else
+              sed -i -E "s/^(\s*option\s+dns\s+.*)$/\1\n\toption enabled '1'/" "$ROOT/etc/config/ddns-go"
+            fi
+            echo "----- /etc/config/ddns-go -----"
+            cat "$ROOT/etc/config/ddns-go"
+          else
+            echo "::warning::rootfs 里没有 /etc/config/ddns-go（ddns-go 包可能不在这个 rootfs）"
+          fi
+
+      - name: ⑦ 写入首次启动钩子（uci-defaults + hotplug 无线自愈）
+        run: |
+          set -e
+          ROOT=""
+          for d in rw rw/*/; do
+            if [ -f "$d/etc/opkg/distfeeds.conf" ]; then ROOT="$d"; break; fi
+          done
+          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录"; exit 1; }
+          echo "rootfs 根目录: $ROOT"
+
+          mkdir -p "$ROOT/etc/uci-defaults"
+          install -m 0755 istore-bootstrap/05-istore-bootstrap "$ROOT/etc/uci-defaults/05-istore-bootstrap"
+          # 96 必须在 95 之后、99 之前：先挪菜单（可选），再做跨主题的 iStore 菜单对齐，最后清缓存
+          install -m 0755 istore-bootstrap/96-istore-theme-align "$ROOT/etc/uci-defaults/96-istore-theme-align"
+          # zz- 开头：uci-defaults 按字母序执行，zz 排最后，保证压过 ddns-go 包自带的 luci-ddns-go
+          install -m 0755 ddnsgo-luci/zz-ddnsgo-luci "$ROOT/etc/uci-defaults/zz-ddnsgo-luci"
+          install -m 0755 istore-bootstrap/99-luci-refresh   "$ROOT/etc/uci-defaults/99-luci-refresh"
+
+          # 98 必须在 96 之后（这时各主题 style.css 已经打过补丁，mtime 才是对的）、99 之前
+          install -m 0755 system-fixes/98-theme-css-cachebust "$ROOT/etc/uci-defaults/98-theme-css-cachebust"
+
+          # 无线路径自愈放 hotplug.d 而不放 uci-defaults：
+          # uci-defaults 在 /etc/init.d/boot 里跑得太早，那时 SDIO 网卡还没枚举完、
+          # /etc/config/wireless 往往还不存在。hotplug 的 add 事件才是网卡刚上线的时刻，
+          # 而且 05 排在 10-wifi-detect 之前，修完再让 detect 去判重，就不会多补一个 radio。
+          # ★ 脚本内部改完配置后还会主动 `( sleep 8; /sbin/wifi reload )` —— 这一步不能省，
+          #   否则 netifd 不会重读，刷机后第一次开机 radio 会一直是 down 的。
+          mkdir -p "$ROOT/etc/hotplug.d/ieee80211"
+          install -m 0755 system-fixes/05-wifi-path-fix "$ROOT/etc/hotplug.d/ieee80211/05-wifi-path-fix"
+
+          # 不再注入 /etc/hotplug.d/block/95-shared-datadir（旧的 F 项）：
+          # 根分区已扩到 4GB，iStore 应用数据保持「最初安装时的默认位置」= 根分区 p2，
+          # 不再把下载/数据目录改写到数据分区。原因见文件头注释。
+
+          if [ "${{ inputs.istore_menu }}" = "true" ]; then
+            echo "启用：把 iStore 菜单挪到「系统」下面"
+            install -m 0755 istore-bootstrap/95-istore-menu-move "$ROOT/etc/uci-defaults/95-istore-menu-move"
+          else
+            echo "保持 iStore 菜单原样（admin/store 顶层）"
+          fi
+
+          echo "===== uci-defaults 内容 ====="
+          ls -l "$ROOT/etc/uci-defaults/"
+          echo "===== 无线自愈钩子 ====="
+          ls -l "$ROOT/etc/hotplug.d/ieee80211/"
+
+          # 兜底：所有首启钩子必须是 LF，否则 #!/bin/sh\r 在设备上直接失效
+          for f in "$ROOT"/etc/uci-defaults/* \
+                   "$ROOT"/etc/hotplug.d/ieee80211/05-wifi-path-fix; do
+            sed -i 's/\r$//' "$f"
+          done
+          echo "----- shebang 字节检查（应为 #!/bin/sh + LF）-----"
+          head -c 12 "$ROOT/etc/uci-defaults/05-istore-bootstrap" | od -c
+          head -c 12 "$ROOT/etc/hotplug.d/ieee80211/05-wifi-path-fix" | od -c
+
+          echo "----- 05-istore-bootstrap -----"
+          cat "$ROOT/etc/uci-defaults/05-istore-bootstrap"
+
+      - name: ⑧ 重新打包 rootfs.tar.gz
+        run: |
+          set -e
+          ROOT=""
+          for d in rw rw/*/; do
+            if [ -f "$d/etc/opkg/distfeeds.conf" ]; then ROOT="$d"; break; fi
+          done
+          [ -n "$ROOT" ] || { echo "::error::未找到 rootfs 根目录"; exit 1; }
+          echo "rootfs 根目录: $ROOT"
+          OUT="opt/download/$ROOTFS"
+          rm -f "$OUT"
+          tar czf "$OUT" -C "$ROOT" .
+          ls -lh "$OUT"
+
+      - name: ⑨ 给 openwrt_packit 打补丁（根分区 4096MB + nodiscard + 千兆 DTB）
+        run: |
+          set -e
+          # F大脚本 openwrt_flippy.sh 的 init_packit_repo() 是：
+          #     cd /opt
+          #     [[ -d "${SELECT_PACKITPATH}" ]] || git clone ... openwrt_packit
+          # 即 **/opt/openwrt_packit 只要已存在，它就完全跳过 clone**。
+          # 所以这里先把上游拉下来、打好分区补丁、再放进 /opt，
+          # 后面 bash flippy-vendor/openwrt_flippy.sh 就会用我们这份。
+          rm -rf /tmp/openwrt_packit
+          git clone -q --single-branch --depth=1 --branch=master \
+            https://github.com/unifreq/openwrt_packit /tmp/openwrt_packit
+          cd /tmp/openwrt_packit
+
+          python3 - <<'PY'
+          import io
+
+          # ① 根分区 1280MB → 4096MB（两个机型的 mk 脚本各一处）
+          #    ROOTFS_MB 一个数控制三件事：
+          #      SIZE              = SKIP_MB + BOOT_MB + ROOTFS_MB   → .img 总大小
+          #      p2 大小            = create_partition 的 "-1" = SIZE − SKIP − BOOT
+          #      /etc/part_size    第 3 列 → 设备首启 first_run.sh 据此补建 p3/p4
+          for f in ("mk_s905d_n1.sh", "mk_s905x3_multi.sh"):
+              s = io.open(f, encoding="utf-8").read()
+              assert s.count("ROOTFS_MB=1280") == 1, "%s: 找不到唯一的 ROOTFS_MB=1280" % f
+              s = s.replace("ROOTFS_MB=1280", "ROOTFS_MB=4096")
+              io.open(f, "w", encoding="utf-8", newline="\n").write(s)
+              print("patched:", f)
+
+          # ② files/first_run.sh（设备首启）：p3(MMC_ROOTFS2 备用槽) 原本等于根分区大小，
+          #    根分区涨到 4G 后 p3 会跟着白占 4G。这里让它固定 1.25G，空间留给 p4 数据区。
+          f = "files/first_run.sh"
+          s = io.open(f, encoding="utf-8").read()
+          a = "ROOTFS_MiB=$(awk '{print $3}' /etc/part_size)"
+          b = "END_P3=$((ROOTFS_MiB * 1024 * 1024 + START_P3 -1))"
+          assert s.count(a) == 1, "first_run.sh: 读取 part_size 的锚点不唯一"
+          assert s.count(b) == 1, "first_run.sh: END_P3 的锚点不唯一"
+          s = s.replace(a, a + "\nROOTFS2_MiB=1280   # p3 备用槽固定 1.25G，不跟随根分区大小")
+          s = s.replace(b, "END_P3=$((ROOTFS2_MiB * 1024 * 1024 + START_P3 -1))")
+          io.open(f, "w", encoding="utf-8", newline="\n").write(s)
+          print("patched:", f)
+
+          # ③ 【本工作流新增】nodiscard：关掉内核 6.2 起的自动异步 discard
+          #    内核 6.2 起 btrfs 对"支持 discard 的设备"自动开 discard=async
+          #    （fs/btrfs/super.c 的 set_device_specific_options()，注释原文：
+          #       "For devices supporting discard turn on discard=async automatically,
+          #        ... This could be turned off by nodiscard for the same mount."）
+          #    盒子上的 2017 白牌 TF 卡 FTL 无掉电保护 → 持续 TRIM 会写坏映射表
+          #    → 断电后 BTRFS: csum failed root 256 → 起不来。
+          #    两个机型都在 rootflags 末尾追加 ,nodiscard（内核作者指定的关闭方式）。
+          for f in ("mk_s905d_n1.sh", "mk_s905x3_multi.sh"):
+              t = io.open(f, encoding="utf-8").read()
+              anchor = "rootflags=compress=zstd:${ZSTD_LEVEL} console=ttyAML0"
+              assert t.count(anchor) == 1, "%s: rootflags 锚点不是唯一一处" % f
+              t = t.replace(anchor,
+                            "rootflags=compress=zstd:${ZSTD_LEVEL},nodiscard console=ttyAML0")
+              io.open(f, "w", encoding="utf-8", newline="\n").write(t)
+              print("patched(nodiscard):", f)
+
+          # ④ 【本工作流新增】X96 Max+ 网卡 DTB：百兆 → 千兆
+          #    上游模板默认启用的是百兆那行，千兆那行被注释掉：
+          #      FDT=/dtb/amlogic/meson-sm1-x96-max-plus-100m.dtb    ← 未注释（生效）
+          #      #FDT=/dtb/amlogic/meson-sm1-x96-max-plus.dtb        ← 被注释
+          #    这里按整行精确匹配后对调注释状态（千兆 DTB 已确认存在于 dtb-amlogic 包内）。
+          f = "mk_s905x3_multi.sh"
+          rows = io.open(f, encoding="utf-8").read().splitlines(keepends=True)
+          hit100 = hit1000 = 0
+          out = []
+          for ln in rows:
+              st = ln.strip()
+              if st == "FDT=/dtb/amlogic/meson-sm1-x96-max-plus-100m.dtb":
+                  out.append(ln.replace("FDT=", "#FDT=", 1)); hit100 += 1
+              elif st == "#FDT=/dtb/amlogic/meson-sm1-x96-max-plus.dtb":
+                  out.append(ln.replace("#FDT=", "FDT=", 1)); hit1000 += 1
+              else:
+                  out.append(ln)
+          assert hit100 == 1, "没找到唯一的百兆 FDT 行（上游模板结构变了？）"
+          assert hit1000 == 1, "没找到唯一的千兆 FDT 行（上游模板结构变了？）"
+          io.open(f, "w", encoding="utf-8", newline="\n").write("".join(out))
+          print("patched(DTB 100m->1000M):", f)
+          PY
+
+          echo "===== 校验：分区尺寸应为 4 / 384 / 4096 ====="
+          grep -n -E '^(SKIP|BOOT|ROOTFS)_MB=' mk_s905d_n1.sh mk_s905x3_multi.sh
+          echo "===== 校验：p3 已与根分区尺寸解绑 ====="
+          grep -n -E 'ROOTFS2_MiB|END_P3=|AVAIABLE_MiB -lt' files/first_run.sh
+          grep -q '^ROOTFS2_MiB=1280' files/first_run.sh \
+            || { echo "::error::first_run.sh 未打上 ROOTFS2_MiB"; exit 1; }
+          grep -q 'END_P3=$((ROOTFS2_MiB' files/first_run.sh \
+            || { echo "::error::first_run.sh 的 END_P3 未改写"; exit 1; }
+
+          echo "===== 校验：nodiscard 已写入两个机型的 APPEND ====="
+          grep -n 'nodiscard' mk_s905d_n1.sh mk_s905x3_multi.sh
+          for f in mk_s905d_n1.sh mk_s905x3_multi.sh; do
+            grep -q 'rootflags=compress=zstd:\${ZSTD_LEVEL},nodiscard ' "$f" \
+              || { echo "::error::$f 未打上 nodiscard"; exit 1; }
+          done
+
+          echo "===== 校验：X96 Max+ 千兆 DTB 已启用、百兆已注释 ====="
+          grep -n '^#\?FDT=/dtb/amlogic/meson-sm1-x96-max-plus' mk_s905x3_multi.sh | head -4
+          grep -qE '^FDT=/dtb/amlogic/meson-sm1-x96-max-plus\.dtb$' mk_s905x3_multi.sh \
+            || { echo "::error::千兆 DTB 未启用"; exit 1; }
+          grep -qE '^#FDT=/dtb/amlogic/meson-sm1-x96-max-plus-100m\.dtb$' mk_s905x3_multi.sh \
+            || { echo "::error::百兆 DTB 未被注释掉"; exit 1; }
+          if grep -qE '^FDT=.*-100m\.dtb$' mk_s905x3_multi.sh; then
+            echo "::error::仍存在未注释的百兆 DTB"; exit 1
+          fi
+          echo "✅ 模板补丁就位：nodiscard（双机型）+ 千兆 DTB（X96Max+）"
+
+          # 放进 /opt，并把属主交还 runner —— 否则后面
+          # init_packit_repo() 里那句 `cp rootfs.tar.gz .` 会因为 /opt 是 root 的而失败。
+          sudo rm -rf /opt/openwrt_packit
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/openwrt_packit
+          cp -a /tmp/openwrt_packit/. /opt/openwrt_packit/
+          ls -ld /opt/openwrt_packit
+          ls /opt/openwrt_packit | head -20
+
+      - name: ⑩ 调用 F大脚本生成固件镜像（最新内核）
+        id: package
+        env:
+          OPENWRT_ARMSR: opt/download/${{ env.ROOTFS }}
+          PACKAGE_SOC: s905x3_s905d
+          KERNEL_REPO_URL: ophub/kernel
+          KERNEL_VERSION_NAME: ${{ inputs.kernel_version }}
+          KERNEL_AUTO_LATEST: 'true'
+          OPENWRT_IP: ${{ inputs.openwrt_ip }}
+          GZIP_IMGS: ${{ inputs.gzip_imgs }}
+          WHOAMI: Haiibo
+          # ⚠️ 下面两行以前**漏了**，导致 `openwrt_ver` 这个 input 完全没作用：
+          #    不传 OPENWRT_VER 时，openwrt_flippy.sh 的默认值是 "auto"，
+          #    它会去读 openwrt_packit/make.env 里的 `OPENWRT_VER="R26.03.25"`，
+          #    所以无论把 openwrt_ver 填成什么，产物文件名永远是 R26.03.25。
+          #    （2026-10-15 实测：填了 R24.1.13，产物仍是 R26.03.25_...）
+          # 不传 DISTRIB_REVISION 时默认 R$(date +%Y.%m.%d)，会被 mk_*.sh 写进
+          #    镜像里的 /etc/openwrt_release，和设备上看到的版本号对不上。
+          # 这两行的写法与 package-science.yml / package-selfcontained.yml 对齐。
+          OPENWRT_VER: ${{ inputs.openwrt_ver }}
+          DISTRIB_REVISION: ${{ inputs.openwrt_ver }}
+        run: |
+          set -o pipefail
+          chmod -R +x flippy-vendor/openwrt_flippy.sh flippy-vendor/openwrt_packit/files 2>/dev/null || true
+          rm -rf openwrt_packit && cp -r flippy-vendor/openwrt_packit openwrt_packit
+          cp "opt/download/$ROOTFS" "openwrt_packit/openwrt-armsr-armv8-generic-rootfs.tar.gz"
+          bash flippy-vendor/openwrt_flippy.sh
+
+      - name: ⑪ 收集产物并校验根分区尺寸（必须 4096MiB）
+        run: |
+          mkdir -p firmware
+          cp -v "${PACKAGED_OUTPUTPATH}"/*.img.gz firmware/ 2>/dev/null || true
+          [ -z "$(ls -A firmware 2>/dev/null)" ] && { echo "::error::无产出"; exit 1; }
+          cd firmware
+
+          # ★ 端到端校验：根分区必须真的是 4096MiB（= 8388608 个 512B 扇区）。
+          #   只校验 CI 里的补丁日志不够——万一上游改了脚本结构、锚点飘了，
+          #   产物会静默退回 1.25G。这里直接解压一个镜像读它的分区表。
+          #
+          #   ⚠️ 不要用 `fdisk -l` 的表格来解析！对**镜像文件**（不是块设备）来说
+          #      "Boot" 列是空的，awk 按空白切列时整行会左移一位，
+          #      $5 拿到的是 Size（"4G"）而不是 Sectors（8388608）——第一次跑就
+          #      因为这个误报过一次，白丢一次构建。改用列名明确的两种方式交叉验证。
+          chk="$(ls *.img.gz | head -n1)"
+          echo "校验镜像: $chk"
+          pigz -dc "$chk" > /tmp/chk.img
+          echo "镜像总大小: $(stat -c %s /tmp/chk.img) 字节（期望 4701814784 = 4484MiB）"
+          echo "----- fdisk -l（给人看）-----"
+          fdisk -l /tmp/chk.img || true
+          echo "----- fdisk -o Device,Sectors（方法A）-----"
+          fdisk -l -o Device,Sectors /tmp/chk.img 2>/dev/null || true
+          echo "----- sfdisk -d（方法B）-----"
+          sfdisk -d /tmp/chk.img 2>/dev/null || true
+
+          p2_a="$(fdisk -l -o Device,Sectors /tmp/chk.img 2>/dev/null | awk '$1 ~ /2$/ {print $2}')"
+          p2_b="$(sfdisk -d /tmp/chk.img 2>/dev/null | awk -F'[:,= ]+' '$1 ~ /img2$/ {for(i=1;i<=NF;i++) if($i=="size") print $(i+1)}')"
+          echo "p2 扇区数: 方法A=${p2_a:-空}  方法B=${p2_b:-空}  （期望 8388608 = 4096MiB）"
+
+          if [ "$p2_a" != "8388608" ] && [ "$p2_b" != "8388608" ]; then
+            echo "::error::根分区不是 4096MiB（A=${p2_a:-空} / B=${p2_b:-空} 扇区），分区补丁没生效！"
+            rm -f /tmp/chk.img
+            exit 1
+          fi
+          echo "✅ 根分区 = 4096MiB"
+          rm -f /tmp/chk.img
+          # 保留上游原始文件名（含 -flippy-95+o / -flippy-95+ 变体标记）：
+          # 「+o」和「+」是两支不同内核变体，改名会把这个信息抹掉，看起来四份一模一样。
+          echo "===== 镜像清单（上游原名，含 +o / + 变体标记）====="
+          for f in *.img.gz; do [ -e "$f" ] || continue; echo "  $f"; done
+          sha256sum ./*.img.gz > sha256sums.txt 2>/dev/null || true
+          ls -lh
+
+      - name: ⑫ 校验产物：uEnv.txt 里 nodiscard 与千兆 DTB 是否真的生效
+        run: |
+          set -e
+          # 前面 ⑨ 只证明"模板改对了"，这一步证明"**产物镜像里真的生效了**"。
+          # 做法：解压 s905x3 那个 .img.gz → losetup -P 挂出 p1(FAT32 /boot)
+          #      → 直接读盘上的 uEnv.txt 逐条断言。
+          chk="$(ls firmware/*s905x3*.img.gz | head -n1)"
+          [ -n "$chk" ] || { echo "::error::firmware/ 里没有 s905x3 镜像"; exit 1; }
+          echo "校验镜像: $chk"
+          pigz -dc "$chk" > /tmp/nod.img
+          echo "镜像大小: $(stat -c %s /tmp/nod.img) 字节"
+
+          LOOP="$(sudo losetup --show -f -P /tmp/nod.img)"
+          echo "loop 设备: $LOOP"
+          ls -l "${LOOP}"p* || true
+          sudo mkdir -p /mnt/uboot
+          sudo mount "${LOOP}p1" /mnt/uboot
+          trap 'sudo umount /mnt/uboot 2>/dev/null || true; sudo losetup -d "$LOOP" 2>/dev/null || true' EXIT
+
+          echo "----- /boot 内容 -----"
+          ls /mnt/uboot | head -30
+          echo "----- uEnv.txt -----"
+          cat /mnt/uboot/uEnv.txt
+
+          grep -q 'rootflags=[^ ]*nodiscard' /mnt/uboot/uEnv.txt \
+            || { echo "::error::产物 uEnv.txt 里没有 nodiscard！"; exit 1; }
+          grep -qE '^FDT=/dtb/amlogic/meson-sm1-x96-max-plus\.dtb[[:space:]]*$' /mnt/uboot/uEnv.txt \
+            || { echo "::error::产物 uEnv.txt 里千兆 DTB 未生效！"; exit 1; }
+          if grep -qE '^FDT=.*-100m\.dtb' /mnt/uboot/uEnv.txt; then
+            echo "::error::产物 uEnv.txt 里仍有未注释的百兆 DTB！"; exit 1
+          fi
+          echo "----- 内核文件（应为本工作流选定的内核版本）-----"
+          ls /mnt/uboot | grep -iE 'vmlinuz|uInitrd|zImage|dtb' || true
+          echo "✅ 产物校验通过：nodiscard 已生效 / 千兆 DTB 已启用 / 百兆 DTB 已注释"
+
+          sudo umount /mnt/uboot
+          sudo losetup -d "$LOOP"
+          rm -f /tmp/nod.img
+
+      - name: ⑬ 发布到 Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: N1-X96MaxPlus-Nodiscard
+          name: "OpenWrt for N1 & X96Max+（iStore + DDNS-GO + nodiscard + 千兆网卡）"
+          allowUpdates: true
+          removeArtifacts: true
+          artifacts: firmware/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### 本次打包（nodiscard + 千兆网卡版）
+
+            > 本 Release 由 **新工作流 `package-nodiscard.yml`** 产出。
+            > 与 `N1-X96MaxPlus-iStore` 的区别只有三处：内核取最新、加了 `nodiscard`、
+            > X96 Max+ 的网卡 DTB 从百兆换成千兆。其余注入项完全一致。
+
+            - 基于 F大官方 rootfs（ophub/flippy-openwrt-actions 月度存档，自动取最新）
+            - 内核：`${{ inputs.kernel_version }}`（ophub/kernel；`x.y.y` = 自动取该系列最新）
+            - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
+            - 机型 × 内核系列 = 镜像数：默认 `6.18.y` → **2 个镜像**；
+              要 4 个就写 `6.12.y_6.18.y`
+            - 文件名保留上游原始命名（如 `…_k6.18.56-flippy-95+.img.gz`），
+              末尾 `-flippy-95+o` / `-flippy-95+` 是两支不同内核变体（`+o` / `+`）
+
+            ### ★ 三项关键改动
+
+            **① `rootflags` 追加 `,nodiscard` —— 关掉自动 TRIM（双机型）**
+
+            内核 **6.2** 起，btrfs 对"支持 discard 的块设备"**自动开启** `discard=async`：
+
+            - btrfs 官方文档 Feature-by-version：`6.2 — discard=async on by default`
+              —— *"Devices that support trim/discard will enable the asynchronous discard
+              for the whole filesystem."*
+            - 内核维护者 David Sterba 的 6.2 合并请求（LKML 2022-12-12）
+              "User visible features" 里明写：**discard=async by default for devices that support it**
+            - **源码铁证**（`fs/btrfs/super.c`）：v6.1 **没有**自动开启代码（仅当用户显式传
+              `discard=async` 才设置标志位）；v6.12 新增 `set_device_specific_options()`，
+              注释原文：
+              *"For devices supporting discard turn on discard=async automatically,
+              unless it's already set or disabled. **This could be turned off by
+              `nodiscard` for the same mount.**"*
+              → **`nodiscard` 正是内核作者指定的关闭方式。**
+
+            为什么这台盒子必须关：TF 卡是 **2017 年生产的白牌卡**（CID 前缀 `12 3456` =
+            Patriot/Gigastone 低成本 OEM 线；实测只跑到 SD high-speed 25MHz，连 UHS 都不支持），
+            其卡内 FTL **没有掉电保护**。持续 TRIM（SD 协议 = `CMD38 ERASE`）会不断擦写
+            FTL 映射表，断电撞上更新中途即损坏，开机会报
+            `BTRFS: csum failed root 256 ino 259` 并**起不来**。
+            换 6.1.163 内核（默认不发 TRIM）后连续两次故意断电均正常恢复、
+            三个 btrfs 分区共 15 项错误计数全为 0 —— 这就是本次加 `nodiscard` 的实证依据。
+
+            改法（CI 自动完成）：把两个机型 mk 脚本里 uEnv 模板的
+            `rootflags=compress=zstd:${ZSTD_LEVEL}` → `…,nodiscard`。
+
+            **② X96 Max+ 网卡 DTB：百兆 → 千兆**
+
+            上游 `mk_s905x3_multi.sh` 的 uEnv 模板里默认启用的是**百兆**那行：
+
+            ```
+            FDT=/dtb/amlogic/meson-sm1-x96-max-plus-100m.dtb     ← 未注释（生效）
+            #FDT=/dtb/amlogic/meson-sm1-x96-max-plus.dtb         ← 被注释
+            ```
+
+            本次按整行精确匹配后**对调注释状态**，改成启用千兆：
+
+            ```
+            #FDT=/dtb/amlogic/meson-sm1-x96-max-plus-100m.dtb
+            FDT=/dtb/amlogic/meson-sm1-x96-max-plus.dtb          ← 生效（千兆）
+            ```
+
+            （`meson-sm1-x96-max-plus.dtb` 已确认存在于所选内核的 `dtb-amlogic` 包内。）
+            刷完后 eth0 应协商为 **1000Mb/s Full**；如仍为百兆，检查是否插在正确的网口/网线。
+
+            **③ 内核默认取最新（`6.18.y` → 6.18.56）**
+
+            新版内核带更新的硬件支持与安全补丁。配上 ① 的 `nodiscard`，
+            "新内核"与"老 TF 卡掉电不崩"这两件事从此可以兼得（本版即是验证样本）。
+
+            ### ★ 产物端到端校验（构建末尾自动执行，失败即整个 job 失败）
+
+            1. 解压 s905x3 镜像 → 读分区表，p2 扇区数必须 = `8388608`（4096MiB）
+            2. `losetup -P` 挂出 p1（FAT32 `/boot`）→ 直接读盘上的 `uEnv.txt`：
+               - 必须含 `rootflags=…,nodiscard`
+               - 必须 `FDT=/dtb/amlogic/meson-sm1-x96-max-plus.dtb`（千兆，生效）
+               - 不得存在未注释的 `FDT=…-100m.dtb`
+
+            也就是说：**"模板改对了"和"产物真的生效了"两道都验**，不靠人工确认。
+
+            ### 已注入的五项定制
+
+            **① iStore 安装方式（已修正）**
+            iStore 不再"解包铺文件"，而是把 6 个官方 ipk 预置到
+            `/usr/share/istore-bootstrap/`，**首次开机由系统自带的 opkg 真正安装**。
+            完整依赖链：`script-utils` + `coreutils-stty` → `taskd` → `luci-lib-taskd`
+            → `luci-lib-xterm` → `luci-app-store`。
+            这样 `/bin/stty` 软链、opkg 数据库登记、首次初始化脚本都会正确执行，
+            「点安装插件」不会再秒失败。
+            首次开机日志见 `/tmp/istore-bootstrap.log`。
+
+            **② iStore 菜单外观（全主题对齐）**
+            LuCI 的 `render_topmenu()` 对"**没有子菜单的顶层项**"输出的是裸
+            `<li><a data-title="iStore" href="...">`，而所有主题的侧边栏样式
+            （缩进、盒模型、hover、图标字体）统统挂在
+            `.main > .main-left > .nav > .slide > a(.menu)` 上。整个 admin 菜单里
+            **只有 iStore 是这种裸项**（Logout / Reboot 也是裸项，但主题作者逐个
+            `data-title` 手工补过 CSS，唯独漏了 iStore）—— 所以它文字贴最左边、没有图标。
+            旧版固件只给 ifit 追加过一段 iStore 专用 CSS，于是表现为
+            "**只有 ifit 能对齐，其它主题全歪**"。
+            现由 `/etc/uci-defaults/96-istore-theme-align` 在首次开机做**主题无关**的修复：
+            改 `header.htm` 的菜单渲染层，把裸项输出成
+            `<li class="slide"><a class="menu exit" data-title="iStore" ...>`，
+            与普通顶层项同构 → 缩进 / 盒模型 / hover / 图标字体全部自动继承主题原生样式；
+            再给各主题的 `script.js` 追加一段**捕获阶段**的点击兜底（叶子项没有子菜单可展开，
+            要抢在主题的 `return false` 之前放行）；并顺手修掉 tomato 主题把
+            `.slide > a` 的 `href` 一并 `removeAttr` 的问题。图标按主题族的图标字体补一个
+            字形码：argon 系取 `ssr` 的 `\e906`(dashboard 宫格)，mcat / atmaterial / tomato
+            取 `advancedtomato` 的 `\e018`(加号＝安装/添加)；material 主题侧边栏本来就没有
+            任何图标、design 自带 `.menu2` 实现、rosy 把叶子项移出 `.nav`，
+            这三者保持原样；ifit 沿用旧版的青色图标（`\e903` + `#26C6DA`），
+            缩进改为跟随主题（旧版硬写的 `padding-left:36px` 现在反而会比同主题
+            其它项多 1px，已去掉）。
+            效果不是"把所有主题强行统一成一个缩进值"，而是"**每个主题内部自洽**"
+            —— 各主题继承到的缩进并不相同（argon 40px、argon_dark 56px、ifit 35px、
+            material 16px、design 50px…），但都与同主题其它项一致。
+
+            **③ DDNS-GO 的 LuCI 菜单**
+            rootfs 里 `ddns-go(6.15.0-1)` 与 `luci-app-ddns-go(1.6.5)` 其实都装好了，
+            但官方 App 用的是 `menu.d/*.json + resources/view/*.js` 新架构，
+            而本固件的 `createindex()` 只扫 `controller/*.lua`、不读 menu.d，
+            `dispatcher.lua` 也没有 `view()` → 菜单**天生不出现**（不是坏了）。
+            现预置一个老式 `controller/ddns-go.lua` + 内嵌 ddns-go 自带 WebUI(:9876)
+            的 `view/ddns-go/ddns-go.htm`，并由 `/etc/uci-defaults/zz-ddnsgo-luci`
+            在首次开机把 `ddns-go.config.enabled` 打开、设为开机自启。
+            刷完后菜单路径：**服务 → DDNS-GO**。
+
+            **④ 无线路径自愈（换内核后 WiFi 掉线的根因）**
+            内核 6.x 把 Amlogic mmc 控制器的 sysfs 名改过：
+            `6.1.x` 是 `platform/soc/ffe03000.sd/...`，`6.18.x` 是 `platform/soc/ffe03000.mmc/...`。
+            如果 `/etc/config/wireless` 是从旧系统带过来的（恢复配置备份），里面写死的老路径
+            在新内核上**永远匹配不到 phy** → `radioN` 报 `"up": false, "retry_setup_failed": true`；
+            同时 `10-wifi-detect` 会以为"这颗 phy 没人认领"，自动补一条 `OpenWrt` 开放网络顶上来
+            —— 表现就是"我的 WiFi 不见了，多了个不认识的网络"。
+            现由 `/etc/hotplug.d/ieee80211/05-wifi-path-fix` 在网卡上线时把
+            `ffeXXXXX.sd/` 批量改成 `ffeXXXXX.mmc/`，并在 `radio1` 与 `radio0` 同路径时删掉 `radio1`，
+            **最后主动 `/sbin/wifi reload` 一次**。
+            ⚠️ 那一次 reload 是必须的：netifd 在 boot 早期就已经用**没修的**配置 `wifi up` 过一次，
+            只改文件不会让它重读，本次开机 `radio0` 会一直停在 `"up": false`（无线全程是死的，
+            不是"重启一下就好"）。延迟 8 秒是为了让 `10-wifi-detect` 先跑完。
+            放 `hotplug.d` 而非 `uci-defaults`：后者在 `/etc/init.d/boot` 里跑得太早，
+            那时 SDIO 网卡还没枚举完、`/etc/config/wireless` 往往还不存在。
+
+            **⑤ 样式表版本后缀（补丁"看起来没生效"的根因）**
+            uhttpd 只发 `ETag` / `Last-Modified`，**不发 `Cache-Control` / `Expires`**。
+            按 RFC 7234 §4.2.2，浏览器会对这类响应做"启发式缓存"，有效期约
+            `(缓存时刻 − Last-Modified) × 10%`。老 `style.css` 的 `Last-Modified` 是出厂日期，
+            缓存一次能"新鲜"几十天，**期间根本不回服务器验证** —— 于是 ② 的菜单对齐补丁明明生效了，
+            浏览器里看到的还是旧界面（按 `Ctrl+Shift+R` 强刷一次才能看到）。
+            现由 `/etc/uci-defaults/98-theme-css-cachebust` 给**所有被打过补丁的主题**的
+            `header.htm` 里 `<link ... .css>` 加上 `?v=<该主题 style.css 的 mtime>`，
+            URL 一变浏览器必然重拉。本来就用动态版本号的主题
+            （argon_dark 系的 `?v=<%=math.random(1,100000)%>`、design 的 `?v=<%=ver.luciversion%>`）
+            会被自动跳过。
+
+            ### ★ 根分区扩容：1280MB → 4096MB
+
+            刷完机后 `/`（`ROOTFS`，也就是 p2）是 **4096MB**，不再是 1280MB。
+
+            | 分区 | 卷标 | 旧 | 新 |
+            |---|---|---|---|
+            | p1 | `BOOT` | 384MB | 384MB（不变） |
+            | p2 | **`ROOTFS`** | **1280MB** | **4096MB** |
+            | p3 | `MMC_ROOTFS2` | 1280MB | 1280MB（不变，A/B 备用槽） |
+            | p4 | `MMC_SHARED` | 剩余空间 | 剩余空间（16GB 卡上约 9.1GB） |
+
+            尺寸的来源与改法（都在 CI 里自动完成，刷机方不需要任何手工操作）：
+
+            - 镜像与分区尺寸**全部**来自 F大打包脚本 `unifreq/openwrt_packit` 里的三个数
+              `SKIP_MB=4 / BOOT_MB=384 / ROOTFS_MB=1280`
+              （`mk_s905d_n1.sh`、`mk_s905x3_multi.sh` 各一份）：
+              `SIZE = 4 + 384 + 1280 = 1668MB` 就是 `.img` 的总大小；
+              p2 由 `create_partition` 的 `-1`（占满剩余）得到 = 1280MB；
+              同时把 `SKIP BOOT ROOTFS` 三列写进 rootfs 的 `/etc/part_size`。
+            - 设备**首次开机**时 `/etc/init.d` 里的 `first_run.sh` 会读 `/etc/part_size`，
+              再往盘尾补建 p3（尺寸 = 第 3 列）与 p4（占满剩余）。
+            - 所以只要把 `ROOTFS_MB` 改成 `4096`：`.img` 变 4484MB、p2 变 4096MB，
+              首启之后 p3/p4 会自动跟着调整。
+            - 但 p3（A/B 备用槽）原本与 p2 同尺寸，p2 涨到 4G 后它会白占 4G，
+              于是同时把 `files/first_run.sh` 里 p3 的尺寸固定回 1.25G，空间留给 p4 数据区。
+            - 上游脚本在 CI 里是 `git clone` 下来的，本来改不到。但主脚本
+              `openwrt_flippy.sh` 的 `init_packit_repo()` 写的是
+              `cd /opt` 然后 `[[ -d openwrt_packit ]] || git clone ...` ——
+              **`/opt/openwrt_packit` 只要已存在就完全跳过 clone**。
+              因此 workflow 里先拉上游、打好补丁、再放进 `/opt`，就让它用了我们这份。
+
+            构建末尾还有一道**端到端校验**：解压一份产物镜像、直接读它的分区表，
+            p2 的扇区数必须等于 `8388608`（= 4096MiB），否则整个 job 直接失败 ——
+            避免上游改脚本结构后静默退回到 1.25G。
+
+            ### ★ nodiscard 与内核版本：怎么自己改回去
+
+            - 想**恢复默认（开 TRIM）**：把工作流里 ③ 那段 `nodiscard` 补丁去掉即可，
+              或者刷完后编辑 `/boot/uEnv.txt`，把 `rootflags=…,nodiscard` 里的
+              `,nodiscard` 删掉。⚠️ `/boot` 是 FAT32 无日志，改之前先备份 `uEnv.txt`。
+            - 想**换内核系列**：重新触发本工作流，把 `kernel_version` 填成 `6.12.y`
+              或 `6.1.y`（6.1.y 只有一个 6.1.163，且本身默认不发 TRIM，`nodiscard` 在它上面是空操作）。
+            - 想**换成 6.18 的另一个 DTB**（如超频版 `…-oc.dtb`、`…-ip1001m.dtb`）：
+              把工作流 ⑨ 里 ④ 那段的两个待匹配行名换掉即可。
+
+            ### ⚠️ 已取消注入：应用数据目录自愈（旧 F 项）
+
+            旧固件里有一项 `/etc/hotplug.d/block/95-shared-datadir`，会把
+            `aria2` / `transmission` / `qbittorrent` / `verysync` / `filebrowser` /
+            `kodexplorer` / `vsftpd` 的**下载与数据目录**统一改写到数据分区
+            （`MMC_SHARED`，10~12GB），并把 `/opt/transmission`、`/opt/kodexplorer`
+            做成指向数据分区的软链。
+
+            那是在「根分区只有 1.25GB、镜像自带程序就占掉 ~600MB、出厂只剩几十 MB」的
+            背景下做的兜底。现在根分区已经是 4GB，而 iStore 应用的
+            **最初安装默认位置本来就是根分区 p2**，所以这一项**不再注入** ——
+            应用的数据/下载目录保持出厂默认值，不再被改写。
+
+            脚本本体仍保留在仓库 `system-fixes/95-shared-datadir` 备查；
+            需要重新启用时，把它加回 workflow 的注入列表即可。
+
+            ### iStore 菜单位置
+            默认保持 iStore 上游原样（`admin/store`，显示在侧边栏顶层）。
+            需要挪到「系统」下面时，重新触发 workflow 并把 `istore_menu` 设为 `true`。
