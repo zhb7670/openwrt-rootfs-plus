@@ -9,6 +9,11 @@
 #        本次改为   FDT=/dtb/amlogic/meson-sm1-x96-max-plus.dtb        （千兆，启用）
 #  其余（rootfs 六项注入、根分区 4096MB、iStore、DDNS-GO、无线自愈…）**与原工作流完全一致**。
 #
+#  ④（**两个工作流共有**，不算差异）刷机后 Docker 自动就位 + p3/p4 关 TRIM：
+#     上游 first_run.sh 的"现存分区必须正好 2 个"守卫会导致它整段放弃 docker 收尾，
+#     现在由 system-fixes/docker-postinstall（START=97，每次开机幂等核对）接管。
+#     见本文件 ⑦ 的注入块与 system-fixes/docker-postinstall 的文件头注释。
+#
 #  ⚠️ 为什么必须加 nodiscard（2026-10-15 已用源码级证据定案）
 #    Linux 内核 **6.2** 起，btrfs 会对"支持 discard 的块设备"**自动开启** discard=async：
 #      · 官方文档 btrfs Feature-by-version：6.2 — discard=async on by default
@@ -678,7 +683,7 @@ jobs:
             新版内核带更新的硬件支持与安全补丁。配上 ① 的 `nodiscard`，
             "新内核"与"老 TF 卡掉电不崩"这两件事从此可以兼得（本版即是验证样本）。
 
-            **④ 刷机后 Docker 自动就位（`docker-postinstall`）**
+            **④ 刷机后 Docker 自动就位（`docker-postinstall`，与 iStore 版同步注入）**
 
             上游 flippy 的首启脚本 `/etc/first_run.sh` 开头有一段"现存分区必须正好 2 个"
             的守卫；**只要刷机后卡上已经存在 p3/p4，它就整段放弃**，于是它后面的
