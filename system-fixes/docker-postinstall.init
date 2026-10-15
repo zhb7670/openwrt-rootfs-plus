@@ -1,0 +1,32 @@
+#!/bin/sh /etc/rc.common
+# =============================================================================
+#  /etc/init.d/docker-postinstall
+#
+#  作用：每次开机把"刷机后收尾"再核对一遍（幂等）——Docker 是否就位、
+#        p3/p4 是否已经关掉 TRIM。真正的逻辑在 /usr/sbin/docker-postinstall。
+#
+#            S11 fstab      /sbin/block mount   挂 p3/p4
+#            S95 done       sh /etc/rc.local    首启时跑 first_run.sh
+#            S97 本脚本     ← 必须在这两个之后、dockerd 之前
+#            S99 dockerd    读 UCI 生成 daemon.json 后启动
+#
+#  构建时就建好 /etc/rc.d/S97docker-postinstall，所以**每次开机**都会执行；
+#  不靠 uci-defaults（那个只在首启跑一次，且跑在 /etc/init.d/boot, START=10，
+#  早于 p3/p4 挂载，拿不到"该在挂载之后做"的时机）。
+# =============================================================================
+
+START=97
+STOP=10
+
+boot() {
+	start
+}
+
+start() {
+	[ -x /usr/sbin/docker-postinstall ] && /usr/sbin/docker-postinstall
+	return 0
+}
+
+stop() {
+	return 0
+}
