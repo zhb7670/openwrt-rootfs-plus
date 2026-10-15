@@ -300,7 +300,8 @@ jobs:
             [ "$s" -gt 524288000 ] || { echo "::error::$f 体积异常($s)"; exit 1; }
             echo "    OK $f ($s 字节)"
           done
-          grep -q "openwrt_s905x3_multi_${{ inputs.openwrt_ver}_k" ./sha256sums.txt \
+          # 注意：${{ inputs.openwrt_ver }} 必须自带闭合的 }}，后面跟字面量 _k 才对
+          grep -q "openwrt_s905x3_multi_${{ inputs.openwrt_ver }}_k" ./sha256sums.txt \
             || echo "::warning::没看到 X96Max+ 的预期文件名，请核对内核版本"
 
       # ------------------------------------------------------------------
