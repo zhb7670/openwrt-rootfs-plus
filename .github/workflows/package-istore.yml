@@ -427,6 +427,16 @@ jobs:
           OPENWRT_IP: ${{ inputs.openwrt_ip }}
           GZIP_IMGS: ${{ inputs.gzip_imgs }}
           WHOAMI: Haiibo
+          # ⚠️ 下面两行以前**漏了**，导致 `openwrt_ver` 这个 input 完全没作用：
+          #    不传 OPENWRT_VER 时，openwrt_flippy.sh 的默认值是 "auto"，
+          #    它会去读 openwrt_packit/make.env 里的 `OPENWRT_VER="R26.03.25"`，
+          #    所以无论把 openwrt_ver 填成什么，产物文件名永远是 R26.03.25。
+          #    （2026-10-15 实测：填了 R24.1.13，产物仍是 R26.03.25_...）
+          # 不传 DISTRIB_REVISION 时默认 R$(date +%Y.%m.%d)，会被 mk_*.sh 写进
+          #    镜像里的 /etc/openwrt_release，和设备上看到的版本号对不上。
+          # 这两行的写法与 package-science.yml / package-selfcontained.yml 对齐。
+          OPENWRT_VER: ${{ inputs.openwrt_ver }}
+          DISTRIB_REVISION: ${{ inputs.openwrt_ver }}
         run: |
           set -o pipefail
           chmod -R +x flippy-vendor/openwrt_flippy.sh flippy-vendor/openwrt_packit/files 2>/dev/null || true
