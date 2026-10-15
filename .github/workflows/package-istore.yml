@@ -102,6 +102,17 @@
 #    dispatcher.lua 也没有 view() 函数 → 官方菜单天生不出现。
 #    解法：补一个老式 controller + 一个内嵌 ddns-go 自带 WebUI(:9876) 的 view，
 #         并把 ddns-go 的 enabled 打开（默认关着 → 不建实例 → 9876 不监听）。
+#  ⚠️ 为什么默认内核从 6.12.y_6.18.y 改成 6.1.y（2026-10-15 实测结论）：
+#    同一份 rootfs（ophub armsr/armv8 24.10.3）配 6.12/6.18 内核时，盒子在**意外断电**
+#    之后会出现 `BTRFS: csum failed root 256 ino 259` 并且起不来；换成 6.1.163 内核后，
+#    连续两次故意断电都正常恢复，三个 btrfs 分区共 15 项错误计数全为 0。
+#    机理：`discard=async` 从内核 6.2 起会在支持 discard 的块设备上**自动开启**，
+#    而 6.1.163 的 btrfs 模块里根本没有这个选项
+#    （设备实测 `strings /lib/modules/6.1.163-flippy-94+o/kernel/fs/btrfs/btrfs.ko | grep -c discard=async` = 0，
+#      且 /proc/mounts 里只有 `ssd` 没有 `discard=async`）。
+#    → 默认收敛到 6.1.y；确实需要新内核时，把 kernel_version 显式写成 6.12.y_6.18.y 即可。
+#    ⚠️ 注意 ophub/kernel 的 kernel_flippy 标签里 6.1.x **只有 6.1.163 一个版本**，
+#       所以 kernel_version=6.1.y 只会产出 2 个镜像（2 机型 × 1 内核），不是 4 个。
 # =============================================================================
 name: Package N1 & X96Max+ (with iStore + DDNS-GO)
 
@@ -109,9 +120,9 @@ on:
   workflow_dispatch:
     inputs:
       kernel_version:
-        description: "内核系列：单个写 6.18.y；要多个用下划线分隔，如 6.12.y_6.18.y（每个系列都自动取最新）"
+        description: "内核系列：单个写 6.1.y；要多个用下划线分隔，如 6.12.y_6.18.y（每个系列都自动取最新）。⚠️ ophub/kernel 的 kernel_flippy 标签里 6.1.x 只有 6.1.163 一个，所以填 6.1.y 只出 2 个镜像（2 机型 × 1 内核）"
         required: false
-        default: "6.12.y_6.18.y"
+        default: "6.1.y"
       openwrt_ver:
         description: "固件版本号"
         required: false
@@ -482,9 +493,12 @@ jobs:
             - 内核：`${{ inputs.kernel_version }}`（ophub/kernel；
               `x.y.y` 表示自动取该系列最新，多个系列用 `_` 分隔）
             - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
-            - **产物 = 机型 × 内核系列**：本次为 2 机型 × 2 内核系列 = **4 个镜像**，
-              **四个镜像都已注入下面五项定制**（注入发生在 rootfs 层，所有镜像共用同一份 rootfs），
-              并且**四个镜像的根分区都已从 1280MB 扩到 4096MB**（改的是打包参数，见下）
+            - **产物 = 机型 × 内核系列**：本次内核输入为 `${{ inputs.kernel_version }}`，
+              **所有镜像都已注入下面五项定制**（注入发生在 rootfs 层，所有镜像共用同一份 rootfs），
+              并且**所有镜像的根分区都已从 1280MB 扩到 4096MB**（改的是打包参数，见下）
+            - ⚠️ **镜像数量取决于内核系列个数**：`ophub/kernel` 的 `kernel_flippy` 标签里
+              **6.1.x 只有 `6.1.163` 一个版本**，所以 `kernel_version=6.1.y` 只会产出
+              **2 个镜像**（`s905x3` + `s905d` 各一）；要 4 个就把内核输入写成 `6.12.y_6.18.y`。
             - **文件名保留上游原始命名**，末尾的 `-flippy-95+o` / `-flippy-95+` 是两支不同的
               内核变体：**`+o` 偏稳、`+` 偏新**（flippy 的两支构建，官方未正式定义，
               社区资料通常说 `+o` 更稳、N1 等盒子更推荐）
