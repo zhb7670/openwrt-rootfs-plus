@@ -1,0 +1,242 @@
+#!/bin/sh
+# =============================================================================
+#  docker-postinstall —— 每次开机核对"刷机后收尾"：Docker 可用性 + p3/p4 关 TRIM
+#
+#  安装位置 : /usr/sbin/docker-postinstall
+#  调用方   : /etc/init.d/docker-postinstall（START=97，构建时即建好
+#             /etc/rc.d/S97docker-postinstall，所以**每次开机**都会跑）
+#  日志     : /tmp/docker-postinstall.log
+#  退出码   : 永远 0（这是开机路径上的脚本，绝不能把 boot 拖挂）
+#
+# -----------------------------------------------------------------------------
+# 一、为什么需要它（2026-10-16 在 192.168.100.1 上实测定案）
+# -----------------------------------------------------------------------------
+# 上游 flippy 的首启脚本 /etc/first_run.sh 开头有一段**分区数守卫**：
+#
+#     CURRENT_PT_CNT=$(parted /dev/${DISK_NAME} print | awk '$1~/[1-9]+/ {print $1}' | wc -l)
+#     if [ "$CURRENT_PT_CNT" != "2" ]; then
+#         echo "现存分区数量不为2,放弃!"
+#         destory_myself
+#         exit 1
+#     fi
+#
+# 只要刷机后开机时卡上**已经存在 p3/p4**（例如不是"裸卡整卡 dd"、或者同一张卡
+# 连刷两遍、或者 p3/p4 本来就在），first_run.sh 就会**从这里直接放弃**。
+# 于是它后面那一整段 docker 收尾逻辑，一次都不会执行：
+#
+#   · /opt/docker 软链没建 —— 而 /etc/config/dockerd 出厂默认
+#       option data_root '/opt/docker/'
+#     新固件又把 /opt/docker 打成了**普通空目录**（时间戳 = 镜像构建时间），
+#     于是 Docker 数据会**静默落到只有 1.25G 的根分区**，而不是 p4 数据盘。
+#
+#   · dockerd 没被 enable —— /etc/rc.d 里只剩 S99dockerman（LuCI 状态页），
+#     没有 S99dockerd，于是 /var/run/docker.sock 永不出现，
+#     `docker ps` 报的正是：
+#       failed to connect to the docker API at unix:///var/run/docker.sock;
+#       ... dial unix /var/run/docker.sock: connect: no such file or directory
+#
+#   · /etc/docker/daemon.json 保持出厂默认 data-root=/mnt/mmcblk2p4/docker/
+#     （那是个**在这台盒子上根本不存在**的 eMMC 分区）。
+#
+# 现场证据：设备上 /root/first_run.log 末尾就是
+#     "现存分区数量不为2,放弃!"
+# 而当时 parted 打印出来的正是 p1..p4 四个分区齐全、p4 已挂载。
+# 也就是说——**刷完机 docker 起不来，根因是首启脚本主动放弃了收尾**，
+# 跟"一键恢复脚本"无关（那个脚本只搬数据，第 0 步还先自检 docker）。
+#
+# -----------------------------------------------------------------------------
+# 二、另一件 flippy 完全没做的事：p3/p4 的 nodiscard
+# -----------------------------------------------------------------------------
+# /boot/uEnv.txt 里的 rootflags=...,nodiscard 是 **per-mount** 的，
+# 只保护"它自己启动的那一个文件系统"（/ = p2）。
+# p3 和 p4 如果不显式关，内核 **6.2 起** btrfs 会自动给它们开 discard=async
+# （源码见 fs/btrfs/super.c 的 set_device_specific_options()，注释原文：
+#   "For devices supporting discard turn on discard=async automatically,
+#    ... This could be turned off by nodiscard for the same mount."）
+# 本机 TF 卡是 2017 年白牌卡，卡内 FTL 无掉电保护 —— 持续 TRIM（SD 的 CMD38 ERASE）
+# 会把映射表写坏，掉电后即 BTRFS: csum failed → 开不了机（已实测 14 分钟打坏 28 块）。
+#
+# -----------------------------------------------------------------------------
+# 三、开机时序（为什么放在 START=97）
+# -----------------------------------------------------------------------------
+#   S11 fstab      /sbin/block mount —— 读 /etc/config/fstab 挂 p3/p4
+#   S95 done       sh /etc/rc.local   —— 首启时在这里跑 first_run.sh
+#   S97 本脚本     ← 放在这里：p3/p4 已挂载（首启由 first_run 负责），
+#                    且一定早于 dockerd
+#   S99 dockerd    读 UCI 生成 /tmp/dockerd/daemon.json 后启动
+#
+# 所有操作**幂等、只补不删、不动分区表、不格式化任何东西**。
+# =============================================================================
+
+LOG=/tmp/docker-postinstall.log
+exec >>"$LOG" 2>&1
+echo "===== docker-postinstall 运行（$(date 2>/dev/null || echo '时间未知')） ====="
+
+P4=/mnt/mmcblk1p4
+DATA_ROOT="$P4/docker"
+BAK="/opt/docker.orig_$(date +%Y%m%d%H%M%S 2>/dev/null || echo bak)"
+
+is_mounted() {
+	awk -v t="$1" '$2 == t { f = 1 } END { exit !f }' /proc/mounts
+}
+mount_has_discard() {
+	awk -v t="$1" '$2 == t && $4 ~ /discard/ { f = 1 } END { exit !f }' /proc/mounts
+}
+
+# =============================================================================
+# 1. 给 p3（备用根槽）/ p4（数据盘）写 nodiscard
+# =============================================================================
+# 已存在同名 section 就只补 options，**不动**它的 device 选择器（uuid 或 label）；
+# 不存在才新建，且按 **label** 建 —— label 由 first_run.sh 固定写死：
+#     mkfs.btrfs -f -L "${LB_PRE}ROOTFS2"   →  MMC_ROOTFS2
+#     mkfs.btrfs -f -L "${LB_PRE}SHARED"    →  MMC_SHARED
+# 用 label 而不是 uuid 的好处：分区还没建（首次刷机）也能先把条目写好，
+# 将来换卡 / 重建分区表导致 uuid 变化也不失配。
+ensure_mount() {
+	_sec="$1"; _tgt="$2"; _lbl="$3"
+	if uci -q get "fstab.$_sec" >/dev/null 2>&1; then
+		uci set "fstab.$_sec.target=$_tgt"
+		uci set "fstab.$_sec.enabled=1"
+	else
+		uci set "fstab.$_sec=mount"
+		uci set "fstab.$_sec.target=$_tgt"
+		uci set "fstab.$_sec.label=$_lbl"
+		uci set "fstab.$_sec.fstype=btrfs"
+		uci set "fstab.$_sec.enabled=1"
+		uci set "fstab.$_sec.enabled_fsck=1"
+	fi
+	_o="$(uci -q get "fstab.$_sec.options")"
+	case "$_o" in
+		*nodiscard*) : ;;
+		'')  uci set "fstab.$_sec.options=nodiscard" ;;
+		*)   uci set "fstab.$_sec.options=${_o},nodiscard" ;;
+	esac
+	echo "fstab.$_sec -> target=$_tgt options='${_o}' +nodiscard"
+}
+
+ensure_mount p3 /mnt/mmcblk1p3 MMC_ROOTFS2
+ensure_mount p4 /mnt/mmcblk1p4 MMC_SHARED
+uci commit fstab
+echo "fstab 已提交"
+
+# =============================================================================
+# 2. p4 本次开机就立刻关掉 discard
+# =============================================================================
+# 上一步写进 fstab 的 nodiscard 要**下次开机**才生效。
+# 本次开机里 p4 很可能已经被 S11（fstab）或 first_run.sh 挂上、且带着
+# discard=async，所以这里直接 remount 关掉。已经关掉则是 no-op。
+if is_mounted "$P4"; then
+	if mount_has_discard "$P4"; then
+		echo "p4 当前带 discard，执行 mount -o remount,nodiscard ..."
+		mount -o remount,nodiscard "$P4" 2>&1 || echo "（remount 失败，已忽略）"
+	else
+		echo "p4 已无 discard，无需处理"
+	fi
+	if is_mounted /mnt/mmcblk1p3 && mount_has_discard /mnt/mmcblk1p3; then
+		echo "p3 当前带 discard，执行 mount -o remount,nodiscard ..."
+		mount -o remount,nodiscard /mnt/mmcblk1p3 2>&1 || echo "（remount 失败，已忽略）"
+	fi
+else
+	echo "p4 尚未挂载，本次跳过 remount（fstab 已写好，下次开机会带 nodiscard）"
+fi
+
+# =============================================================================
+# 3. /opt/docker 必须是软链，指向真实数据盘
+# =============================================================================
+_ok=no
+if [ -L /opt/docker ]; then
+	_cur="$(readlink /opt/docker)"
+	if [ "$_cur" = "$DATA_ROOT/" ] || [ "$_cur" = "$DATA_ROOT" ]; then
+		_ok=yes
+		echo "/opt/docker 软链已正确 -> $_cur"
+	fi
+fi
+
+if [ "$_ok" = no ]; then
+	if [ -d /opt/docker ] && [ ! -L /opt/docker ]; then
+		# 新固件把它打成普通空目录。只在**确实为空**时才删；
+		# 只要里面有东西就改名保留，绝不静默丢数据。
+		if [ -z "$(ls -A /opt/docker 2>/dev/null)" ]; then
+			if rmdir /opt/docker 2>/dev/null; then
+				echo "/opt/docker 是空目录，已移除"
+			else
+				mv -f /opt/docker "$BAK" 2>/dev/null \
+					&& echo "/opt/docker 是空目录但删不掉，已改名到 $BAK"
+			fi
+		else
+			mv -f /opt/docker "$BAK" 2>/dev/null \
+				&& echo "/opt/docker 是非空目录，已改名保留到 $BAK"
+		fi
+	else
+		rm -f /opt/docker 2>/dev/null
+	fi
+	ln -s "$DATA_ROOT/" /opt/docker 2>/dev/null \
+		&& echo "/opt/docker -> $DATA_ROOT/" \
+		|| echo "!! 创建 /opt/docker 软链失败"
+fi
+
+# p4 没挂上就不要再往下走：此时 mkdir / 启动 dockerd 会把数据写到根分区上
+if ! is_mounted "$P4"; then
+	echo "p4 未挂载 —— 本轮的 dockerd 处理推迟到下次开机（首启由 first_run.sh 负责）"
+	echo "===== 结束（fstab 已更新）====="
+	exit 0
+fi
+
+mkdir -p "$DATA_ROOT" 2>/dev/null
+
+# =============================================================================
+# 4. dockerd 开机自启
+# =============================================================================
+WAS_ENABLED=no
+[ -e /etc/rc.d/S99dockerd ] && WAS_ENABLED=yes
+
+if [ -x /etc/init.d/dockerd ]; then
+	if /etc/init.d/dockerd enable >/dev/null 2>&1; then
+		echo "dockerd enable ok"
+	else
+		echo "!! dockerd enable 失败"
+	fi
+else
+	echo "!! 没有 /etc/init.d/dockerd，跳过"
+fi
+
+# =============================================================================
+# 5. UCI 数据根（dockerd 每次启动都用它重新生成 /tmp/dockerd/daemon.json）
+# =============================================================================
+if ! uci -q get dockerd.globals >/dev/null 2>&1; then
+	uci set dockerd.globals=globals
+fi
+uci set dockerd.globals.data_root="$DATA_ROOT/"
+uci set dockerd.globals.auto_start='1'
+uci commit dockerd
+echo "dockerd.globals.data_root=$DATA_ROOT/  auto_start=1"
+
+# =============================================================================
+# 6. /etc/docker/daemon.json —— 只作为 first_run.sh 的读取来源，顺手纠正
+# =============================================================================
+# 注意：这个文件**不是** dockerd 实际使用的配置。dockerd 用的是
+# /etc/init.d/dockerd 每次启动从 UCI 重新生成的 /tmp/dockerd/daemon.json。
+# 但 first_run.sh 会读它来填 UCI，所以留着错的会被它带偏，这里一起纠正。
+if [ -f /etc/docker/daemon.json ]; then
+	if grep -q '/mnt/mmcblk2p4/docker' /etc/docker/daemon.json 2>/dev/null; then
+		sed -i "s#/mnt/mmcblk2p4/docker/#$DATA_ROOT/#g" /etc/docker/daemon.json \
+			&& echo "/etc/docker/daemon.json 的 data-root 已纠正"
+	fi
+fi
+
+# =============================================================================
+# 7. 若 S99dockerd 是本脚本刚建出来的，rcS 这一轮已经错过它 —— 手动拉起
+# =============================================================================
+# rcS 在执行开始时就把 /etc/rc.d/S* 展开成列表了，运行中途新建的软链不会被补上。
+# 所以"本次新 enable"的情况必须自己 start 一次（此时 p4 已挂载，是安全的）。
+if [ "$WAS_ENABLED" = no ] && [ -x /etc/init.d/dockerd ]; then
+	echo "S99dockerd 是本轮新建的，rcS 已错过 -> 手动 start"
+	if /etc/init.d/dockerd start >/dev/null 2>&1; then
+		echo "dockerd start ok"
+	else
+		echo "!! dockerd start 失败（看 /tmp/docker-postinstall.log 与 logread）"
+	fi
+fi
+
+echo "===== docker-postinstall 结束 ====="
+exit 0
