@@ -1,0 +1,332 @@
+# =============================================================================
+#  科学插件保真打包（N1 + X96Max+）—— 带"预检 + 可移植"的打包工作流
+#
+#  【它和 package-selfcontained.yml 的区别】
+#    selfcontained     : 只管打包，打完是什么就是什么
+#    本文件（science）  : 在「下载 rootfs」和「打包」之间插了两道预检，外加一条
+#                        可选的「移植补救」通道：
+#      ① 预检 A（rootfs）：确认 5 个科学插件真的在 rootfs 里，并算出它们依赖的
+#                          内核模块清单（.ko 名字）
+#      ② 预检 B（内核）  : 把 ① 算出来的 .ko 逐个丢到目标内核包里核对
+#                          （模块里有 或 内核内建，都算"有"）—— 因为降内核最容易
+#                          踩的坑就是"插件在、但内核模块不全，装了也跑不起来"
+#      ③ 移植补救（可选）: 万一哪天上游 rootfs 真的把这 5 个插件删了，可以用另一个
+#                          「供体 rootfs」按包清单把文件补回去（只在缺包时才走）
+#
+#  【默认目标】
+#    openwrt_s905x3_multi_R24.1.13_k6.1.163.img.gz
+#      - rootfs : ophub armv8（已按 sha256 锁死，见 inputs.rootfs_sha256）
+#      - 内核   : ophub/kernel 的 kernel_flippy 6.1.x → 实际取到 6.1.163-flippy-94+o
+#      - 默认 IP: 192.168.100.1   （用户 root / 密码 password）
+#      - 5 个科学插件：luci-app-openclash / luci-app-passwall / luci-app-passwall2
+#                      luci-app-ssr-plus / luci-app-ssr-mudb-server
+#      - 其余 1200+ 个包**一个都不动**（移植通道只会新增，不会覆盖已有包）
+#
+#  【发布到新 tag】N1-X96MaxPlus-Science —— 刻意不覆盖已有的 N1-X96MaxPlus
+# =============================================================================
+name: Package N1 & X96Max+ (science plugins guaranteed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rootfs_tag:
+        description: "rootfs 所在的 Release tag"
+        required: false
+        default: "OpenWrt_armv8_save_2026.10"
+      rootfs_asset:
+        description: "rootfs 资产名"
+        required: false
+        default: "openwrt-armsr-armv8-generic-rootfs.tar.gz"
+      rootfs_sha256:
+        description: "rootfs 的 sha256（留空=不校验；默认值即当前 V1/目标固件共用的那一份）"
+        required: false
+        default: "35ea000b2cca9ac4efb1c5143a0ea8bc496d365c8c926781dfdcbcf4fefbfae9"
+      kernel_version:
+        description: "内核系列（6.1.y=自动取 kernel_flippy 里最新 6.1.x）"
+        required: false
+        default: "6.1.y"
+      openwrt_ver:
+        description: "固件版本号（决定产物文件名 + DISTRIB_REVISION）"
+        required: false
+        default: "R24.1.13"
+      openwrt_ip:
+        description: "固件默认 LAN IP"
+        required: false
+        default: "192.168.100.1"
+      science_pkgs:
+        description: "要保真的科学插件（空格分隔，其余插件不动）"
+        required: false
+        default: "luci-app-openclash luci-app-passwall luci-app-passwall2 luci-app-ssr-plus luci-app-ssr-mudb-server"
+      donor_asset:
+        description: "【仅缺包时才需要】供体 rootfs 资产名（放在本仓库 tag=ROOTFS 的 Release 里）"
+        required: false
+        default: ""
+      release_tag:
+        description: "发布到哪个 Release tag"
+        required: false
+        default: "N1-X96MaxPlus-Science"
+      gzip_imgs:
+        description: "镜像压缩方式"
+        required: false
+        default: "gz"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-science
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  package:
+    name: 打包 N1 + X96Max+（科学插件保真）
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Checkout（含本地化打包脚本 + science/ 预检工具）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y btrfs-progs dosfstools e2fsprogs util-linux uuid-runtime \
+            fdisk parted gawk tar pigz p7zip-full rsync wget curl jq xz-utils zstd python3
+
+      # ------------------------------------------------------------------
+      # 1. 准备 rootfs（按 tag+资产名直接取，并做 sha256 校验）
+      # ------------------------------------------------------------------
+      - name: 准备 rootfs
+        id: rootfs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          mkdir -p opt/download
+          ASSET="${{ inputs.rootfs_asset }}"
+          TAG="${{ inputs.rootfs_tag }}"
+          URL="https://github.com/ophub/flippy-openwrt-actions/releases/download/${TAG}/${ASSET}"
+          echo ">>> 下载 rootfs: ${URL}"
+          curl -fSL --retry 3 --retry-delay 5 -H "Authorization: Bearer $GH_TOKEN" \
+               "$URL" -o "opt/download/${ASSET}"
+          ls -l --block-size=1 opt/download/
+          echo "ROOTFS_NAME=${ASSET}" >> $GITHUB_ENV
+
+          WANT="${{ inputs.rootfs_sha256 }}"
+          GOT=$(sha256sum "opt/download/${ASSET}" | awk '{print $1}')
+          echo ">>> rootfs sha256 = ${GOT}"
+          if [ -n "${WANT}" ] && [ "${WANT}" != "${GOT}" ]; then
+            echo "::error::rootfs 指纹不匹配（期望 ${WANT}，实际 ${GOT}）——上游换包了，必须先复核插件集再打包"
+            exit 1
+          fi
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      # ------------------------------------------------------------------
+      # 2. 预检 A：rootfs 里 5 个科学插件在不在 + 算出 .ko 清单
+      #    缺包时：有供体 → 继续（走移植）；没供体 → 立刻失败，不产出残废固件
+      # ------------------------------------------------------------------
+      - name: 预检 A · rootfs 科学插件
+        id: guard
+        run: |
+          set -o pipefail
+          RF="opt/download/${ROOTFS_NAME}"
+          set +e
+          python3 science/science_guard.py check-rootfs \
+            --rootfs "$RF" \
+            --pkgs "${{ inputs.science_pkgs }}" \
+            --out "$RUNNER_TEMP/guard.txt" \
+            --ko-out "$RUNNER_TEMP/science-ko.txt"
+          rc=$?
+          set -e
+          echo "science-guard exit=$rc"
+          if [ $rc -eq 0 ]; then
+            echo ">>> 5 个科学插件都在 rootfs 里，无需移植"
+            echo "need_port=false" >> ${GITHUB_OUTPUT}
+          elif [ -n "${{ inputs.donor_asset }}" ]; then
+            echo ">>> rootfs 里缺插件，但已指定供体 → 走移植补救"
+            echo "need_port=true" >> ${GITHUB_OUTPUT}
+          else
+            echo "::error::rootfs 缺少科学插件且未指定 donor_asset —— 已中止，不产出缺插件的固件"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # 3. 预检 B：目标内核能不能撑起这些插件（逐个 .ko 核对）
+      # ------------------------------------------------------------------
+      - name: 预检 B · 内核模块
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          SERIES=$(echo "${{ inputs.kernel_version }}" | sed -E 's/\.y$//')
+          python3 science/science_guard.py check-kernel \
+            --series "$SERIES" \
+            --ko-file "$RUNNER_TEMP/science-ko.txt" \
+            --kernel "" \
+            --workdir "$RUNNER_TEMP"
+
+      # ------------------------------------------------------------------
+      # 4. 【可选】移植补救：从供体 rootfs 按包清单补文件（只在缺包时执行）
+      #    安全红线：kernel / kmod-* / libc / iptables 这类系统级包一律不许硬拷，
+      #    脚本会直接报错退出（那种情况必须换 rootfs，不能靠拷文件糊过去）。
+      # ------------------------------------------------------------------
+      - name: 【可选】移植补救（从供体 rootfs 补插件）
+        if: steps.guard.outputs.need_port == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          RF="opt/download/${ROOTFS_NAME}"
+          DONOR="$RUNNER_TEMP/donor.tar.gz"
+          WORK="$RUNNER_TEMP/target-work"
+          DWORK="$RUNNER_TEMP/donor-work"
+
+          echo ">>> 下载供体 rootfs: ${{ inputs.donor_asset }}"
+          curl -fSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" \
+            "https://github.com/${{ github.repository }}/releases/download/ROOTFS/${{ inputs.donor_asset }}" \
+            -o "$DONOR"
+
+          echo ">>> 生成移植计划（含安全红线检查）"
+          python3 science/science_guard.py plan-port \
+            --donor-tar "$DONOR" --target-tar "$RF" \
+            --pkgs "${{ inputs.science_pkgs }}" \
+            --plan "$RUNNER_TEMP/port-plan.tsv" --names "$RUNNER_TEMP/port-names.txt"
+
+          echo ">>> 解包（供体 + 目标各一次）"
+          sudo rm -rf "$WORK" "$DWORK"; mkdir -p "$WORK" "$DWORK"
+          sudo tar -xzf "$DONOR" -C "$DWORK" -p
+          sudo tar -xzf "$RF"    -C "$WORK"  -p
+
+          echo ">>> 按计划复制文件（只新增，不覆盖已有文件）"
+          copied=0; skipped=0; miss=0
+          while IFS=$'\t' read -r pkg rel; do
+            [ -z "$rel" ] && continue
+            src="$DWORK/$rel"; dst="$WORK/$rel"
+            if sudo test -e "$dst" || sudo test -L "$dst"; then skipped=$((skipped+1)); continue; fi
+            if ! sudo test -e "$src" && ! sudo test -L "$src"; then
+              echo "    [warn] 供体里没有 $rel"; miss=$((miss+1)); continue
+            fi
+            sudo mkdir -p "$(dirname "$dst")"
+            sudo cp -a "$src" "$dst"
+            copied=$((copied+1))
+          done < "$RUNNER_TEMP/port-plan.tsv"
+          echo ">>> 复制完成：新增 $copied / 目标已有跳过 $skipped / 供体缺失 $miss"
+          [ "$miss" -eq 0 ] || { echo "::error::供体缺文件，移植不完整"; exit 1; }
+
+          echo ">>> 合并 opkg 数据库（只新增缺失包的条目）"
+          sudo python3 science/science_guard.py merge-status \
+            --target "$WORK/usr/lib/opkg/status" \
+            --donor-tar "$DONOR" \
+            --names "$RUNNER_TEMP/port-names.txt"
+
+          echo ">>> 重新打包 rootfs（保持原文件名，打包脚本只认这个名）"
+          sudo rm -f "$RF"
+          ( cd "$WORK" && sudo tar -cpf - . ) | pigz -9 > "$RF.new"
+          mv "$RF.new" "$RF"
+          ls -l --block-size=1 "$RF"
+
+          echo ">>> 移植后复核（必须重新通过预检 A，否则不许继续）"
+          python3 science/science_guard.py check-rootfs \
+            --rootfs "$RF" \
+            --pkgs "${{ inputs.science_pkgs }}" \
+            --out "$RUNNER_TEMP/guard-after.txt" \
+            --ko-out "$RUNNER_TEMP/science-ko-after.txt"
+          echo ">>> 移植后 rootfs 指纹: $(sha256sum "$RF" | awk '{print $1}')"
+
+      # ------------------------------------------------------------------
+      # 5. 打包（本地化的 openwrt_flippy.sh，不依赖 unifreq 仓库）
+      # ------------------------------------------------------------------
+      - name: 打包固件
+        env:
+          OPENWRT_ARMSR: opt/download/${{ env.ROOTFS_NAME }}
+          PACKAGE_SOC: s905x3_s905d
+          KERNEL_REPO_URL: ophub/kernel
+          KERNEL_VERSION_NAME: ${{ inputs.kernel_version }}
+          KERNEL_AUTO_LATEST: 'true'
+          OPENWRT_IP: ${{ inputs.openwrt_ip }}
+          GZIP_IMGS: ${{ inputs.gzip_imgs }}
+          WHOAMI: flippy
+          OPENWRT_VER: ${{ inputs.openwrt_ver }}
+          DISTRIB_REVISION: ${{ inputs.openwrt_ver }}
+          SAVE_OPENWRT_ROOTFS: "false"
+        run: |
+          set -o pipefail
+          chmod +x flippy-vendor/openwrt_flippy.sh 2>/dev/null || true
+          chmod -R +x flippy-vendor/openwrt_packit/files 2>/dev/null || true
+
+          echo "===== 本地化资源检查 ====="
+          ls -lh flippy-vendor/openwrt_flippy.sh
+          echo "openwrt_packit/ 存在: $([ -d flippy-vendor/openwrt_packit ] && echo YES || echo NO)"
+
+          rm -rf openwrt_packit
+          cp -r flippy-vendor/openwrt_packit openwrt_packit
+          cp -v "opt/download/${ROOTFS_NAME}" \
+                "openwrt_packit/openwrt-armsr-armv8-generic-rootfs.tar.gz"
+
+          echo "===== 执行打包 ====="
+          bash flippy-vendor/openwrt_flippy.sh
+
+      # ------------------------------------------------------------------
+      # 6. 收集产物：文件名去掉 -flippy-<n> 尾巴 + 算 sha256
+      # ------------------------------------------------------------------
+      - name: 收集产物并校验
+        run: |
+          set -e
+          mkdir -p firmware
+          cp -v "${PACKAGED_OUTPUTPATH}"/*.img.gz firmware/ 2>/dev/null || true
+          cp -v "${PACKAGED_OUTPUTPATH}"/*.sha256 firmware/ 2>/dev/null || true
+          if [ -z "$(ls -A firmware 2>/dev/null)" ]; then
+            echo "::error::没有产出镜像，请翻日志"; exit 1
+          fi
+          cd firmware
+          for f in *flippy*.img.gz; do
+            [ -e "$f" ] || continue
+            n=$(echo "$f" | sed -E 's/-flippy-[0-9]+[^.]*//')
+            [ "$f" != "$n" ] && mv -v "$f" "$n"
+          done
+          rm -f ./*.sha256 2>/dev/null || true
+          sha256sum ./*.img.gz > sha256sums.txt
+          ls -lh
+
+          echo ">>> 文件名 / 体积自检"
+          for f in ./*.img.gz; do
+            s=$(stat -c%s "$f")
+            [ "$s" -gt 524288000 ] || { echo "::error::$f 体积异常($s)"; exit 1; }
+            echo "    OK $f ($s 字节)"
+          done
+          grep -q "openwrt_s905x3_multi_${{ inputs.openwrt_ver}_k" ./sha256sums.txt \
+            || echo "::warning::没看到 X96Max+ 的预期文件名，请核对内核版本"
+
+      # ------------------------------------------------------------------
+      # 7. 发布（新 tag，不覆盖已有 release）
+      # ------------------------------------------------------------------
+      - name: 发布到 Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ inputs.release_tag }}
+          name: "OpenWrt for N1 & X96Max+（科学插件保真）"
+          allowUpdates: true
+          removeArtifacts: true
+          artifactErrorsFailBuild: false
+          artifacts: firmware/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### 本次打包（科学插件保真）
+            - rootfs: `${{ inputs.rootfs_asset }}` @ `${{ inputs.rootfs_tag }}`
+              （sha256 已校验：`${{ inputs.rootfs_sha256 }}`）
+            - 内核: `${{ inputs.kernel_version }}`（ophub/kernel · kernel_flippy）
+            - 保真的科学插件: `${{ inputs.science_pkgs }}`
+            - 移植补救: `${{ inputs.donor_asset }}`（留空=rootfs 本来就带，没走移植）
+            - 默认地址/密码: `${{ inputs.openwrt_ip }}` / password
+            - 机型: `s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
+            - 其余插件**保持原样**（移植通道只新增缺失包，不覆盖已有包）
+
+            ### 两道预检
+            1. rootfs 预检：确认 5 个科学插件都在，并算出它们依赖的 `.ko` 清单
+            2. 内核预检：逐个核对目标内核是否提供这些 `.ko`（模块或内建）
