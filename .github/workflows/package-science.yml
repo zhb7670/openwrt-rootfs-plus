@@ -23,12 +23,31 @@
 #      - 其余 1200+ 个包**一个都不动**（移植通道只会新增，不会覆盖已有包）
 #
 #  【发布到新 tag】N1-X96MaxPlus-Science —— 刻意不覆盖已有的 N1-X96MaxPlus
+#
+#  【两条 rootfs 血统（2026-10-15 溯源结论）】
+#    路径 A（默认，推荐）：
+#       rootfs = ophub 官方 armsr/armv8（OpenWrt 24.10.3，sha256 35ea000b…fae9）
+#       —— 和 V1 / N1-X96MaxPlus 系列完全同一份，5 个 2026 版科学插件**已经在里面**，
+#          预检 A 直接通过，无需移植。内核降到 6.1.163 后 55 个 .ko 全部齐全（已实测）。
+#    路径 B（复刻老固件原貌，慎用）：
+#       rootfs_repo    = haiibo/OpenWrt
+#       rootfs_tag     = ROOTFS_PLUS        （或 ARMv8_PLUS）
+#       rootfs_asset   = openwrt-armvirt-64-generic-rootfs.tar.gz
+#       rootfs_sha256  = fea5f0af39b65c8ee90bd95073dad4fd007b171de9ed003b220d46e02076441d
+#       —— 这才是老固件（armvirt/64、OpenWrt SNAPSHOT r6389-053f193d0）真正用的 rootfs。
+#          但它是 2024-01 的 SNAPSHOT，**不含** 2026 版科学插件：预检 A 会报 MISSING 并
+#          中止（除非同时填 donor_asset 走移植通道）。跨 2 年移植 userspace 插件风险高，
+#          除非只想要"和老固件一模一样"的稳定基线，否则请用路径 A。
 # =============================================================================
 name: Package N1 & X96Max+ (science plugins guaranteed)
 
 on:
   workflow_dispatch:
     inputs:
+      rootfs_repo:
+        description: "rootfs 来源仓库。ophub/flippy-openwrt-actions=官方 armv8（默认，已含 5 个科学插件）；haiibo/OpenWrt=老固件同血统（armvirt/64，2024-01 SNAPSHOT，不含新版科学插件）"
+        required: false
+        default: "ophub/flippy-openwrt-actions"
       rootfs_tag:
         description: "rootfs 所在的 Release tag"
         required: false
@@ -111,7 +130,8 @@ jobs:
           mkdir -p opt/download
           ASSET="${{ inputs.rootfs_asset }}"
           TAG="${{ inputs.rootfs_tag }}"
-          URL="https://github.com/ophub/flippy-openwrt-actions/releases/download/${TAG}/${ASSET}"
+          REPO="${{ inputs.rootfs_repo }}"
+          URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
           echo ">>> 下载 rootfs: ${URL}"
           curl -fSL --retry 3 --retry-delay 5 -H "Authorization: Bearer $GH_TOKEN" \
                "$URL" -o "opt/download/${ASSET}"
@@ -300,7 +320,6 @@ jobs:
             [ "$s" -gt 524288000 ] || { echo "::error::$f 体积异常($s)"; exit 1; }
             echo "    OK $f ($s 字节)"
           done
-          # 注意：${{ inputs.openwrt_ver }} 必须自带闭合的 }}，后面跟字面量 _k 才对
           grep -q "openwrt_s905x3_multi_${{ inputs.openwrt_ver }}_k" ./sha256sums.txt \
             || echo "::warning::没看到 X96Max+ 的预期文件名，请核对内核版本"
 
