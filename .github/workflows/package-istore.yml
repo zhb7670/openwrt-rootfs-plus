@@ -453,6 +453,24 @@ jobs:
           io.open(f, "w", encoding="utf-8", newline="\n").write(s)
           print("patched:", f)
 
+          # ③ 【本次新增】nodiscard：关掉内核 6.2 起 btrfs 的自动异步 discard
+          #    内核 6.2 起，btrfs 对"支持 discard 的块设备"**自动开启** discard=async
+          #    （fs/btrfs/super.c 的 set_device_specific_options()，注释原文：
+          #       "For devices supporting discard turn on discard=async automatically,
+          #        ... This could be turned off by nodiscard for the same mount."）
+          #    → 必须显式 nodiscard 才关得掉。
+          #    ⚠️ 这一段只保护**根分区 / (p2)**；p3/p4 由 START=97 的
+          #       /etc/init.d/docker-postinstall 每次开机写 fstab + remount 关掉
+          #       （p3/p4 平时是 /sbin/block hotplug 自动挂载的，那条路径不读 options，
+          #        所以必须靠每次开机 remount 兜底）。
+          for f in ("mk_s905d_n1.sh", "mk_s905x3_multi.sh"):
+              t = io.open(f, encoding="utf-8").read()
+              anchor = "rootflags=compress=zstd:${ZSTD_LEVEL} console=ttyAML0"
+              assert t.count(anchor) == 1, "%s: rootflags 锚点不是唯一一处" % f
+              t = t.replace(anchor,
+                            "rootflags=compress=zstd:${ZSTD_LEVEL},nodiscard console=ttyAML0")
+              io.open(f, "w", encoding="utf-8", newline="\n").write(t)
+              print("patched(nodiscard):", f)
           # ⑤ 【本工作流新增】first_run.sh 首启自建的 p3/p4，挂载时也要带 nodiscard
           #    ③ 改的 rootflags 是 **per-mount**，只保护它启动的那个文件系统（/ = p2）。
           #    首启且卡上只有 2 个分区时，p3/p4 是 first_run.sh 现建的，它的 mount 命令
@@ -487,6 +505,14 @@ jobs:
                 || { echo "::error::first_run.sh 的 p$_n mount 未带 nodiscard"; exit 1; }
             done
             echo "✅ first_run.sh p3/p4 mount 已带 nodiscard"
+
+            echo "===== 校验：nodiscard 已写入两个机型的 APPEND ====="
+            grep -n 'nodiscard' mk_s905d_n1.sh mk_s905x3_multi.sh
+            for f in mk_s905d_n1.sh mk_s905x3_multi.sh; do
+              grep -q 'rootflags=compress=zstd:\${ZSTD_LEVEL},nodiscard ' "$f" \
+                || { echo "::error::$f 未打上 nodiscard"; exit 1; }
+            done
+            echo "✅ 根分区 nodiscard 已就位（p3/p4 由 docker-postinstall 每次开机兜底）"
 
           # 放进 /opt，并把属主交还 runner —— 否则后面
           # init_packit_repo() 里那句 `cp rootfs.tar.gz .` 会因为 /opt 是 root 的而失败。
@@ -595,15 +621,22 @@ jobs:
                 同一内核系列下：`…k6.12.112-flippy-95+o.img.gz`（带 o）
                               `…k6.18.56-flippy-95+.img.gz`（不带 o）
 
-            ### ★ 新增：docker-postinstall（刷机后 Docker 自动就位）
+            ### ★ 新增：docker-postinstall（刷机后 Docker 自动就位）+ 根分区 nodiscard
 
             > 上游 `first_run.sh` 在"现存分区必须正好 2 个"的守卫处会直接放弃，
             > 导致刷完机 docker 起不来（`/var/run/docker.sock` 不存在），
             > 还得人工"维修"一遍。本版把收尾独立成 `START=97` 的
             > `/etc/init.d/docker-postinstall`，**每次开机**幂等核对：
             > `/opt/docker` 软链 / `dockerd` 自启 / UCI `data_root` /
-            > p3+p4 的 `nodiscard`（含当场 `remount,nodiscard` 关掉 discard）。
+            > p3+p4 的 `nodiscard`（含当场 `remount,nodiscard` 关掉 discard，
+            > 以及"分区在但没挂上"时自己补挂）。
             > 详见 `system-fixes/docker-postinstall` 文件头注释。
+            >
+            > **同时给根分区 `/` 补上了 `rootflags=...,nodiscard`**：
+            > 内核 6.2 起 btrfs 会对支持 discard 的设备自动开 `discard=async`，
+            > 之前 iStore 版只靠 6.1 内核"碰巧不发 TRIM"，一旦换 6.12/6.18 构建
+            > 根分区就会立刻暴露。现在**三个 btrfs 分区全部关闭 TRIM**：
+            > p2 走 `rootflags`，p3/p4 走 `docker-postinstall` 每次开机兜底。
 
             ### 已注入的五项定制
 
