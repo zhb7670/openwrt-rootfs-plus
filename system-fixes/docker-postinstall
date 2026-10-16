@@ -8,6 +8,10 @@
 #  日志     : /tmp/docker-postinstall.log
 #  退出码   : 永远 0（这是开机路径上的脚本，绝不能把 boot 拖挂）
 #
+#  两种模式 : 默认 = **关掉 TRIM**（给 p3/p4 加 nodiscard，适配廉价 TF 卡）；
+#             若镜像里放了 /etc/docker-postinstall.keep-discard，则 = **保留内核原版 TRIM**
+#             （供"原版行为 / 新卡对照"固件使用）。两套固件只差这一个标记文件。
+#
 # -----------------------------------------------------------------------------
 # 一、为什么需要它（2026-10-16 在 192.168.100.1 上实测定案）
 # -----------------------------------------------------------------------------
@@ -87,6 +91,20 @@ P4=/mnt/mmcblk1p4
 DATA_ROOT="$P4/docker"
 BAK="/opt/docker.orig_$(date +%Y%m%d%H%M%S 2>/dev/null || echo bak)"
 
+# -----------------------------------------------------------------------------
+# 0. 本机要不要保留内核原版的 TRIM（discard）行为？
+# -----------------------------------------------------------------------------
+# 默认 = **关掉** TRIM（nodiscard）—— 适配"廉价 TF 卡 + 内核 6.2+"这个高危组合。
+# 若镜像里存在 /etc/docker-postinstall.keep-discard，则**保留内核原版行为**
+# （p3/p4 也按内核默认自动开 discard=async），供"原版 / 新卡对照"固件使用。
+#
+# 两套固件**只差这一个标记文件**，钩子的 docker 修复逻辑完全一致：
+#   无标记 → 写 fstab(nodiscard) + remount 关掉 discard + 补挂带 nodiscard
+#   有标记 → 完全不碰 fstab 的 TRIM 设置、不做 remount、补挂也不带 nodiscard
+KEEP_DISCARD=no
+[ -e /etc/docker-postinstall.keep-discard ] && KEEP_DISCARD=yes
+echo "TRIM 策略：KEEP_DISCARD=$KEEP_DISCARD（no=关TRIM  yes=保留内核原版TRIM）"
+
 is_mounted() {
 	awk -v t="$1" '$2 == t { f = 1 } END { exit !f }' /proc/mounts
 }
@@ -125,10 +143,14 @@ ensure_mount() {
 	echo "fstab.$_sec -> target=$_tgt options='${_o}' +nodiscard"
 }
 
-ensure_mount p3 /mnt/mmcblk1p3 MMC_ROOTFS2
-ensure_mount p4 /mnt/mmcblk1p4 MMC_SHARED
-uci commit fstab
-echo "fstab 已提交"
+if [ "$KEEP_DISCARD" = no ]; then
+	ensure_mount p3 /mnt/mmcblk1p3 MMC_ROOTFS2
+	ensure_mount p4 /mnt/mmcblk1p4 MMC_SHARED
+	uci commit fstab
+	echo "fstab 已提交"
+else
+	echo "KEEP_DISCARD=yes：跳过 fstab，保持内核原版行为（p3/p4 由 hotplug 挂到 /mnt/<dev>）"
+fi
 
 # =============================================================================
 # 2. p4 本次开机就立刻关掉 discard
@@ -136,19 +158,23 @@ echo "fstab 已提交"
 # 上一步写进 fstab 的 nodiscard 要**下次开机**才生效。
 # 本次开机里 p4 很可能已经被 S11（fstab）或 first_run.sh 挂上、且带着
 # discard=async，所以这里直接 remount 关掉。已经关掉则是 no-op。
-if is_mounted "$P4"; then
-	if mount_has_discard "$P4"; then
-		echo "p4 当前带 discard，执行 mount -o remount,nodiscard ..."
-		mount -o remount,nodiscard "$P4" 2>&1 || echo "（remount 失败，已忽略）"
+if [ "$KEEP_DISCARD" = no ]; then
+	if is_mounted "$P4"; then
+		if mount_has_discard "$P4"; then
+			echo "p4 当前带 discard，执行 mount -o remount,nodiscard ..."
+			mount -o remount,nodiscard "$P4" 2>&1 || echo "（remount 失败，已忽略）"
+		else
+			echo "p4 已无 discard，无需处理"
+		fi
+		if is_mounted /mnt/mmcblk1p3 && mount_has_discard /mnt/mmcblk1p3; then
+			echo "p3 当前带 discard，执行 mount -o remount,nodiscard ..."
+			mount -o remount,nodiscard /mnt/mmcblk1p3 2>&1 || echo "（remount 失败，已忽略）"
+		fi
 	else
-		echo "p4 已无 discard，无需处理"
-	fi
-	if is_mounted /mnt/mmcblk1p3 && mount_has_discard /mnt/mmcblk1p3; then
-		echo "p3 当前带 discard，执行 mount -o remount,nodiscard ..."
-		mount -o remount,nodiscard /mnt/mmcblk1p3 2>&1 || echo "（remount 失败，已忽略）"
+		echo "p4 尚未挂载，本次跳过 remount"
 	fi
 else
-	echo "p4 尚未挂载，本次跳过 remount"
+	echo "KEEP_DISCARD=yes：保留内核原版 discard=async，不做 remount"
 fi
 
 # =============================================================================
@@ -172,8 +198,9 @@ try_mount() {
 	fi
 	[ -n "$_real" ] || return 1
 	mkdir -p "$_tgt" 2>/dev/null
-	if mount -t btrfs -o nodiscard "$_real" "$_tgt" 2>/dev/null; then
-		echo "已补挂 $_real -> $_tgt（带 nodiscard）"
+	if [ "$KEEP_DISCARD" = no ]; then _o="-o nodiscard"; else _o=""; fi
+	if mount -t btrfs $_o "$_real" "$_tgt" 2>/dev/null; then
+		echo "已补挂 $_real -> $_tgt（${_o:-无额外选项}）"
 	else
 		echo "补挂 $_real -> $_tgt 失败（可能已被其它机制挂上，忽略）"
 	fi
