@@ -44,6 +44,17 @@
 # 也就是说——**刷完机 docker 起不来，根因是首启脚本主动放弃了收尾**，
 # 跟"一键恢复脚本"无关（那个脚本只搬数据，第 0 步还先自检 docker）。
 #
+# 【补充】p3/p4 平时是谁挂的（2026-10-16 继续挖到，很重要）
+#   镜像自带的 /etc/config/fstab 里**只有 /rom 和 /boot**
+#   （上游 public_funcs 的 create_fstab_config 根本不写 p3/p4）。
+#   那 p3/p4 是怎么挂上的？—— `/etc/hotplug.d/block/10-mount` 在块设备 add 时调
+#   `/sbin/block hotplug`，把"没有 fstab 条目"的设备一律挂到 `/mnt/<设备名>`。
+#   这条"自动挂载"路径**不读任何 options**，所以它挂出来的 p4 一定没有 nodiscard
+#   —— 这就是 p4 被 discard=async 打坏 28 个块、而根分区（有 rootflags nodiscard）
+#      毫发无伤的直接原因。
+#   因此本脚本除了写 fstab 条目，还必须**每次开机 remount 一次**兜底（见第 2 节），
+#   并且在"分区在但还没挂上"时自己补挂一次（见第 2b 节）。
+#
 # -----------------------------------------------------------------------------
 # 二、另一件 flippy 完全没做的事：p3/p4 的 nodiscard
 # -----------------------------------------------------------------------------
@@ -137,8 +148,38 @@ if is_mounted "$P4"; then
 		mount -o remount,nodiscard /mnt/mmcblk1p3 2>&1 || echo "（remount 失败，已忽略）"
 	fi
 else
-	echo "p4 尚未挂载，本次跳过 remount（fstab 已写好，下次开机会带 nodiscard）"
+	echo "p4 尚未挂载，本次跳过 remount"
 fi
+
+# =============================================================================
+# 2b. p3/p4 存在但还没被挂上 —— 自己补挂（首启 first_run.sh 放弃时会走到这里）
+# =============================================================================
+# 正常情况 p3/p4 由两套机制挂载：
+#   ① /etc/config/fstab —— 本脚本上一轮写进去的 nodiscard 条目
+#   ② /sbin/block 的 hotplug 自动挂载：/etc/hotplug.d/block/10-mount 调
+#      `/sbin/block hotplug`，把"没有 fstab 条目"的块设备一律挂到 /mnt/<设备名>。
+#      ⚠️ 这条路径**不读 options**，所以它挂出来的一定没有 nodiscard
+#         —— 这正是 p4 之前被 discard=async 打坏 28 个块的直接原因。
+# 而镜像自带的 /etc/config/fstab 里**只有 /rom 和 /boot**
+# （上游 create_fstab_config 不写 p3/p4），所以刷机后第一轮开机可能出现
+# "分区在、但还没挂上"的窗口。这里直接补挂，避免还要多重启一次。
+try_mount() {
+	_dev="$1"; _tgt="$2"; _lbl="$3"
+	is_mounted "$_tgt" && return 0
+	_real="$(blkid -t "LABEL=$_lbl" -o device 2>/dev/null | head -n1)"
+	if [ -z "$_real" ] && [ -b "$_dev" ]; then
+		_real="$_dev"
+	fi
+	[ -n "$_real" ] || return 1
+	mkdir -p "$_tgt" 2>/dev/null
+	if mount -t btrfs -o nodiscard "$_real" "$_tgt" 2>/dev/null; then
+		echo "已补挂 $_real -> $_tgt（带 nodiscard）"
+	else
+		echo "补挂 $_real -> $_tgt 失败（可能已被其它机制挂上，忽略）"
+	fi
+}
+try_mount /dev/mmcblk1p3 /mnt/mmcblk1p3 MMC_ROOTFS2
+try_mount /dev/mmcblk1p4 /mnt/mmcblk1p4 MMC_SHARED
 
 # =============================================================================
 # 3. /opt/docker 必须是软链，指向真实数据盘
@@ -175,10 +216,10 @@ if [ "$_ok" = no ]; then
 		|| echo "!! 创建 /opt/docker 软链失败"
 fi
 
-# p4 没挂上就不要再往下走：此时 mkdir / 启动 dockerd 会把数据写到根分区上
+# p4 还是没挂上就不要再往下走：此时 mkdir + 启动 dockerd 会把数据写到根分区上
 if ! is_mounted "$P4"; then
-	echo "p4 未挂载 —— 本轮的 dockerd 处理推迟到下次开机（首启由 first_run.sh 负责）"
-	echo "===== 结束（fstab 已更新）====="
+	echo "p4 仍未挂载（已尝试补挂失败）—— dockerd 处理推迟到下次开机"
+	echo "===== 结束（fstab 已更新，下次开机 p3/p4 会带 nodiscard 挂上）====="
 	exit 0
 fi
 
