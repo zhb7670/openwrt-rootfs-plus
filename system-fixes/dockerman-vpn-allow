@@ -1,0 +1,126 @@
+#!/bin/sh /etc/rc.common
+# =============================================================================
+#  dockerman 访问控制放行 VPN 端口（dockerman-vpn-allow）
+#
+#  为什么需要：
+#    luci-app-dockerman 的「访问控制(AC)」会建一条 DOCKER-MAN 链挂到 DOCKER-USER：
+#        -A DOCKER-MAN -i br-lan -o docker0 -j RETURN              # 只放行 br-lan
+#        -A DOCKER-MAN -o docker0 --ctstate RELATED,ESTABLISHED -j RETURN
+#        -A DOCKER-MAN -o docker0 --ctstate INVALID,NEW -j DROP    # 其余新连接全丢
+#    VPN（NetBird 等）流量是从 docker 自己的网桥（br-<netid>）进来的，不在白名单里，
+#    于是被最后那条 DROP 丢掉 → 容器发布的端口（iptv 1905 / NPM 81·8066·8443）打不开。
+#    注意：这条链只挂在 FORWARD 上，所以只有经过 DNAT 的发布端口会中招。
+#
+#  做什么（幂等、只增不删、永远 exit 0）：
+#    ① 按端口放行（主手段，**不受网桥改名影响**）：
+#         dockerd.dockerman.ac_allowed_ports += 1905/tcp 81/tcp 8066/tcp 8443/tcp
+#       对应规则：-A DOCKER-MAN -p tcp --ctorigdstport <port> --ctdir ORIGINAL -j RETURN
+#    ② 按接口放行（补充手段，覆盖"以后新加的容器"）：
+#       后台起一个有上限的重试，等 docker 就绪后动态解析名字含 netbird 的 docker 网络，
+#       把它的网桥（br-<netid>）加进 ac_allowed_interface。
+#       不硬编码 br-c0caa90fa40e —— 该 ID 在 compose 网络被删重建后会变。
+#       后台化是为了不阻塞 rcS 启动。
+#
+#  START=99，且文件名排在 dockerd / dockerman 之后（S99dockerd < S99dockerman <
+#  S99dockerman-vpn-allow），保证执行时前两者已就位。
+#
+#  手动执行：/etc/init.d/dockerman-vpn-allow start
+#  查看结果：uci show dockerd | grep -E 'ac_allowed_(ports|interface)'
+# =============================================================================
+START=99
+STOP=10
+
+ALLOW_PORTS="1905/tcp 81/tcp 8066/tcp 8443/tcp"
+LOG=/tmp/dockerman-vpn-allow.log
+LOCK=/tmp/.dockerman-vpn-bridge.lock
+
+_uget() {
+    uci get "$1" 2>/dev/null || true
+}
+
+# 端口是否已在列表里
+_has_port() {
+    for x in $(_uget dockerd.dockerman.ac_allowed_ports); do
+        [ "$x" = "$1" ] && return 0
+    done
+    return 1
+}
+
+_apply_ports() {
+    local changed=0
+    for p in $ALLOW_PORTS; do
+        if ! _has_port "$p"; then
+            uci add_list dockerd.dockerman.ac_allowed_ports="$p" || return 0
+            changed=1
+        fi
+    done
+    [ "$changed" = "1" ] && uci commit dockerd
+    [ "$changed" = "1" ] && echo "$(date '+%F %T') 已补端口: $ALLOW_PORTS" >> "$LOG"
+    [ "$changed" = "1" ] && return 1
+    return 0
+}
+
+# 找名字含 netbird 的 docker 网络对应的网桥（docker 网桥名 = br-<12位网络ID>）
+_netbird_bridges() {
+    docker network ls --format '{{.ID}} {{.Name}}' 2>/dev/null \
+        | awk '$2 ~ /netbird/ {print "br-" $1}' \
+        | while read -r br; do
+              [ -d "/sys/class/net/$br" ] && echo "$br"
+          done
+}
+
+_apply_bridge_once() {
+    local br added=0
+    for br in $(_netbird_bridges); do
+        if ! _uget dockerd.dockerman.ac_allowed_interface | tr ' ' '\n' | grep -qx "$br"; then
+            uci add_list dockerd.dockerman.ac_allowed_interface="$br" || continue
+            echo "$(date '+%F %T') 已补接口: $br" >> "$LOG"
+            added=1
+        fi
+    done
+    if [ "$added" = "1" ]; then
+        uci commit dockerd
+        /etc/init.d/dockerman restart >/dev/null 2>&1
+        return 0
+    fi
+    return 1
+}
+
+# 后台有上限重试：最多 12 次 × 5s = 60s，抓到就跑，抓不到就放弃（端口规则已经兜底）
+_apply_bridge_bg() {
+    [ -e "$LOCK" ] && return 0
+    : > "$LOCK"
+    (
+        i=0
+        while [ $i -lt 12 ]; do
+            if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+                _apply_bridge_once && break
+            fi
+            i=$((i + 1))
+            sleep 5
+        done
+        rm -f "$LOCK"
+    ) &
+}
+
+start() {
+    # dockerman 没装就不用管
+    [ -f /etc/init.d/dockerman ] || return 0
+    [ -x /sbin/uci ] || return 0
+
+    _apply_ports
+    [ -f /etc/init.d/dockerman ] || return 0
+    /etc/init.d/dockerman restart >/dev/null 2>&1
+
+    _apply_bridge_bg
+    return 0
+}
+
+boot() {
+    start
+}
+
+shutdown() {
+    rm -f "$LOCK"
+    return 0
+}
