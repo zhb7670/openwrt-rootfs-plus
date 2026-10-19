@@ -150,33 +150,24 @@ jobs:
           ls -lh pkg/
           [ "$(ls pkg/*.ipk | wc -l)" -eq 6 ] || { echo "::error::ipk 数量不是 6"; exit 1; }
 
-      - name: ④ 拉取并解包 F大 rootfs（钉死 tag + sha256 校验）
+      - name: ④ 拉取并解包 F大 rootfs（自动取 ophub 最新存档）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          # ★ 钉死 rootfs 版本 —— Stock / Nodiscard 是 A/B 对照组，底层必须逐字相同。
-          #   原逻辑 `sort_by(.a.n) | reverse | .[0]` 依赖"资产名字符串排序"，而 ophub
-          #   各 release 的 rootfs 资产名可能同名或改前缀，排序结果不稳定 → 今天重打
-          #   可能悄悄换掉底层 rootfs，破坏"只差 TRIM 一个变量"的对照前提。
-          #   故改为：按 tag 精确固定 + sha256 校验，一变就失败，绝不静默换版。
-          ROOTFS_TAG="OpenWrt_armv8_save_2026.10"
-          ROOTFS_NAME="openwrt-armsr-armv8-generic-rootfs.tar.gz"
-          ROOTFS_SHA256="35ea000b2cca9ac4efb1c5143a0ea8bc496d365c8c926781dfdcbcf4fefbfae9"
           rel=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-                 "https://api.github.com/repos/ophub/flippy-openwrt-actions/releases/tags/$ROOTFS_TAG" \
-               | jq -r --arg n "$ROOTFS_NAME" '.assets[] | select(.name == $n) | {n:.name,u:.url}')
-          url=$(echo "$rel" | jq -r '.u')
-          name=$(echo "$rel" | jq -r '.n')
-          { [ -n "$url" ] && [ "$url" != "null" ]; } \
-            || { echo "::error::$ROOTFS_TAG 里找不到资产 $ROOTFS_NAME"; exit 1; }
-          echo "rootfs: $name  (pinned tag=$ROOTFS_TAG)"
+                 "https://api.github.com/repos/ophub/flippy-openwrt-actions/releases?per_page=30" \
+               | jq -r '[.[] | select(.tag_name != "v0.1.0")
+                        | {tag:.tag_name,
+                           a:(.assets[]|select(.name|test("rootfs"))|{n:.name,u:.url})}
+                        | select(.a != null)]
+                    | sort_by(.a.n) | reverse | .[0]')
+          url=$(echo "$rel" | jq -r '.a.u')
+          name=$(echo "$rel" | jq -r '.a.n')
+          echo "rootfs: $name"
           mkdir -p opt/download
           curl -fSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
                "$url" -o "opt/download/$name"
-          echo "===== 校验 rootfs sha256（钉死，防止上游被替换）====="
-          echo "$ROOTFS_SHA256  opt/download/$name" | sha256sum -c - \
-            || { echo "::error::rootfs sha256 不匹配，底层已变，中止"; exit 1; }
           echo "ROOTFS=$name" >> $GITHUB_ENV
           rm -rf rw && mkdir rw
           tar xzf "opt/download/$name" -C rw
@@ -301,24 +292,6 @@ jobs:
           ln -sf ../init.d/docker-postinstall "$ROOT/etc/rc.d/S97docker-postinstall"
           echo "已注入 docker-postinstall（START=97）"
 
-          # ★ 通用自愈（两个工作流**逐字相同**，不属于对照组差异，且绝不触碰 discard）
-          #   ① netdata-owner-fix（S98）：opkg 装的 /usr/share/netdata/web 属主是 1001:1001，
-          #      而 netdata 以 root 运行 → 静态文件全部 403
-          #      `Access to file is not permitted: /usr/share/netdata/web//index.html`
-          #      脚本开机把属主对齐到 root:root 并在 netdata.conf 补 web files owner/group。
-          #   ② dockerman-vpn-allow（S99）：dockerman 的 AC 默认只放行 br-lan，
-          #      VPN 进来访问 docker0 上发布的端口会被 DROP → 补按端口放行
-          #      （--ctorigdstport，不受网桥改名影响）+ 动态补 netbird 网桥。
-          install -m 0755 system-fixes/netdata-owner-fix    "$ROOT/etc/init.d/netdata-owner-fix"
-          ln -sf ../init.d/netdata-owner-fix   "$ROOT/etc/rc.d/S98netdata-owner-fix"
-          install -m 0755 system-fixes/dockerman-vpn-allow  "$ROOT/etc/init.d/dockerman-vpn-allow"
-          ln -sf ../init.d/dockerman-vpn-allow "$ROOT/etc/rc.d/S99dockerman-vpn-allow"
-          echo "已注入 netdata-owner-fix(S98) / dockerman-vpn-allow(S99)"
-
-          echo "===== 两个自愈脚本是否就位 ====="
-          ls -l "$ROOT/etc/init.d/netdata-owner-fix" "$ROOT/etc/init.d/dockerman-vpn-allow" \
-                "$ROOT/etc/rc.d/S98netdata-owner-fix" "$ROOT/etc/rc.d/S99dockerman-vpn-allow"
-
           echo "===== uci-defaults 内容 ====="
           ls -l "$ROOT/etc/uci-defaults/"
           echo "===== 无线自愈钩子 ====="
@@ -368,7 +341,7 @@ jobs:
           tar czf "$OUT" -C "$ROOT" .
 
           echo "===== 校验 rootfs.tar.gz 里确实有 docker-postinstall 三件套 ====="
-          for p in usr/sbin/docker-postinstall etc/init.d/docker-postinstall etc/rc.d/S97docker-postinstall etc/init.d/netdata-owner-fix etc/rc.d/S98netdata-owner-fix etc/init.d/dockerman-vpn-allow etc/rc.d/S99dockerman-vpn-allow; do
+          for p in usr/sbin/docker-postinstall etc/init.d/docker-postinstall etc/rc.d/S97docker-postinstall; do
             if tar tzf "$OUT" | grep -q "/$p$"; then
               echo "  ok  $p"
             else
@@ -648,8 +621,7 @@ jobs:
             > 与 `N1-X96MaxPlus-iStore` 的区别只有三处：内核取最新、加了 `nodiscard`、
             > X96 Max+ 的网卡 DTB 从百兆换成千兆。其余注入项完全一致。
 
-            - 基于 F大官方 rootfs（ophub/flippy-openwrt-actions `OpenWrt_armv8_save_2026.10` 存档）
-              —— **已钉死版本 + sha256 校验**（Stock/Nodiscard 必须共用同一份底层以保证对照纯正）
+            - 基于 F大官方 rootfs（ophub/flippy-openwrt-actions 月度存档，自动取最新）
             - 内核：`${{ inputs.kernel_version }}`（ophub/kernel；`x.y.y` = 自动取该系列最新）
             - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
             - 机型 × 内核系列 = 镜像数：默认 `6.18.y` → **2 个镜像**；
