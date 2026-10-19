@@ -1,0 +1,76 @@
+#!/bin/sh /etc/rc.common
+# =============================================================================
+#  netdata 静态文件属主自愈（netdata-owner-fix）
+#
+#  为什么需要：
+#    netdata 的静态文件服务会校验文件属主/属组是否等于 `web files owner/group`
+#    （未配置时 = 运行用户），不符就返回 403：
+#        Access to file is not permitted: /usr/share/netdata/web//index.html
+#    源码逻辑（web/server/web_client.c）：
+#        if (statbuf.st_uid != web_files_uid()) { ... Access Denied ... }
+#        if (statbuf.st_gid != web_files_gid()) { ... Access Denied ... }
+#
+#    本固件里 netdata 以 root 运行（netdata.conf: run as user = root），
+#    而 opkg 包解出来的 /usr/share/netdata/web 属主是 1001:1001（打包机构建 UID），
+#    于是 expected 0 / actual 1001 → 全部静态文件 403，实时监控打不开。
+#
+#  做什么（幂等、只补不删、永远 exit 0）：
+#    ① 属主对齐：/usr/share/netdata/web 之下只要有一个不属于 root:root 就整体 chown
+#    ② 配置固化：netdata.conf 的 [web] 段没有 web files owner/group 就补上 = root
+#
+#  START=98 —— 必须早于 /etc/init.d/netdata（START=99），这样 netdata 启动时读到的
+#  已经是修好的状态，不需要额外重启。
+#
+#  手动执行：/etc/init.d/netdata-owner-fix start
+# =============================================================================
+START=98
+STOP=10
+
+WEB_DIR=/usr/share/netdata/web
+CONF=/etc/netdata/netdata.conf
+LOG=/tmp/netdata-owner-fix.log
+
+_fix_owner() {
+    [ -d "$WEB_DIR" ] || return 0
+    # 只看"存在且不属于 root:root"的条目，避免每次开机都无谓 chown 124 个文件
+    if [ -n "$(find "$WEB_DIR" ! -user root -o ! -group root 2>/dev/null | head -n1)" ]; then
+        chown -R root:root "$WEB_DIR" 2>/dev/null
+        echo "$(date '+%F %T') 已 chown -R root:root $WEB_DIR" >> "$LOG"
+        return 1
+    fi
+    return 0
+}
+
+_fix_conf() {
+    [ -f "$CONF" ] || return 0
+    grep -q 'web files owner' "$CONF" && return 0
+    TAB=$(printf '\t')
+    awk -v t="$TAB" '
+        { print }
+        /^\[web\]/ {
+            print t "web files owner = root"
+            print t "web files group = root"
+        }
+    ' "$CONF" > "$CONF.tmp" 2>/dev/null || { rm -f "$CONF.tmp"; return 0; }
+    [ -s "$CONF.tmp" ] || { rm -f "$CONF.tmp"; return 0; }
+    mv "$CONF.tmp" "$CONF"
+    echo "$(date '+%F %T') 已在 [web] 段补写 web files owner/group = root" >> "$LOG"
+    return 1
+}
+
+start() {
+    # netdata 没装就什么都不做（此时也不会有这个 403）
+    [ -x /usr/sbin/netdata ] || return 0
+
+    _fix_owner
+    _fix_conf
+    return 0
+}
+
+boot() {
+    start
+}
+
+shutdown() {
+    return 0
+}
