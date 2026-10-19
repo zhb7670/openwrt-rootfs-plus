@@ -611,7 +611,8 @@ jobs:
             > **只差一个变量 —— TRIM**。其余（内核、DTB、iStore、DDNS-GO、无线自愈、
             > 根分区 4096MB、docker-postinstall 的 docker 修复逻辑）**逐字相同**。
 
-            - 基于 F大官方 rootfs（ophub/flippy-openwrt-actions 月度存档，自动取最新）
+            - 基于 F大官方 rootfs（ophub/flippy-openwrt-actions `OpenWrt_armv8_save_2026.10` 存档）
+              —— **已钉死版本 + sha256 校验**（Stock/Nodiscard 必须共用同一份底层以保证对照纯正）
             - 内核：`${{ inputs.kernel_version }}`（ophub/kernel；`x.y.y` = 自动取该系列最新）
             - 机型：`s905d`=斐讯N1；`s905x3`=X96Max+/HK1/H96MaxX3/TX3
             - 机型 × 内核系列 = 镜像数：默认 `6.18.y` → **2 个镜像**
